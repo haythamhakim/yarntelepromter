@@ -75,6 +75,19 @@ export function buildLines(
   return lines;
 }
 
+export function getWordsPerLineForTextSize(textSize: number): number {
+  if (textSize >= 120) {
+    return 2;
+  }
+  if (textSize >= 96) {
+    return 3;
+  }
+  if (textSize >= 72) {
+    return 4;
+  }
+  return DEFAULT_WORDS_PER_LINE;
+}
+
 export function buildChunks(
   tokens: ScriptToken[],
   chunkSize: number = 20,
@@ -111,12 +124,15 @@ export function buildChunks(
   return chunks;
 }
 
-export function prepareScript(script: string): PreparedScript {
+export function prepareScript(
+  script: string,
+  wordsPerLine: number = DEFAULT_WORDS_PER_LINE,
+): PreparedScript {
   const tokens = tokenizeScript(script);
   return {
     rawText: script,
     tokens,
-    lines: buildLines(tokens),
+    lines: buildLines(tokens, wordsPerLine),
     chunks: buildChunks(tokens),
   };
 }

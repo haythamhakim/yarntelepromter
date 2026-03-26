@@ -1,28 +1,17 @@
 import { NextResponse } from "next/server";
 
+import {
+  DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_VOICE,
+  DEFAULT_TRANSCRIPTION_LANGUAGE,
+  DEFAULT_TRANSCRIPTION_MODEL,
+  DEFAULT_TRUNCATION_CONFIG,
+} from "@/lib/realtime/config";
+import { buildRealtimeSessionInstructions } from "@/lib/realtime/prompt";
+
 export const runtime = "nodejs";
 
-const DEFAULT_REALTIME_MODEL = "gpt-4o-realtime-preview";
-
-type RealtimeSessionRequestBody = {
-  scriptLanguage?: unknown;
-};
-
-function normalizeLanguageCode(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  const normalized = trimmed.toLowerCase();
-  return /^[a-z]{2,3}(?:-[a-z0-9]{2,8})?$/.test(normalized) ? normalized : null;
-}
-
-export async function POST(request: Request) {
+export async function POST() {
   const apiKey = process.env.OPENAI_API_KEY;
   const model = process.env.OPENAI_REALTIME_MODEL ?? DEFAULT_REALTIME_MODEL;
 
@@ -34,36 +23,45 @@ export async function POST(request: Request) {
   }
 
   try {
-    let scriptLanguage: string | null = null;
-    const rawBody = await request.text();
-    if (rawBody.trim()) {
-      let parsedBody: RealtimeSessionRequestBody;
-      try {
-        parsedBody = JSON.parse(rawBody) as RealtimeSessionRequestBody;
-      } catch {
-        return NextResponse.json(
-          { error: "Invalid JSON body." },
-          { status: 400 },
-        );
-      }
-      scriptLanguage = normalizeLanguageCode(parsedBody.scriptLanguage);
-    }
+    const effectiveLanguage = DEFAULT_TRANSCRIPTION_LANGUAGE;
 
-    const response = await fetch("https://api.openai.com/v1/realtime/sessions", {
+    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model,
-        modalities: ["text", "audio"],
-        input_audio_transcription: {
-          model: "gpt-4o-mini-transcribe",
-          ...(scriptLanguage ? { language: scriptLanguage } : {}),
-        },
-        turn_detection: {
-          type: "server_vad",
+        session: {
+          type: "realtime",
+          model,
+          output_modalities: ["text"],
+          instructions: buildRealtimeSessionInstructions(effectiveLanguage),
+          truncation: DEFAULT_TRUNCATION_CONFIG,
+          audio: {
+            input: {
+              format: {
+                type: "audio/pcm",
+                rate: 24000,
+              },
+              turn_detection: {
+                type: "semantic_vad",
+                create_response: false,
+                interrupt_response: true,
+              },
+              transcription: {
+                model: DEFAULT_TRANSCRIPTION_MODEL,
+                language: effectiveLanguage,
+              },
+            },
+            output: {
+              voice: DEFAULT_REALTIME_VOICE,
+              format: {
+                type: "audio/pcm",
+                rate: 24000,
+              },
+            },
+          },
         },
       }),
     });
@@ -77,11 +75,12 @@ export async function POST(request: Request) {
     }
 
     const data = (await response.json()) as {
+      value?: string;
       client_secret?: { value?: string };
-      model?: string;
+      session?: { model?: string };
     };
 
-    const clientSecret = data.client_secret?.value;
+    const clientSecret = data.value ?? data.client_secret?.value;
     if (!clientSecret) {
       return NextResponse.json(
         { error: "Realtime session did not include a client secret." },
@@ -91,7 +90,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       clientSecret,
-      model: data.model ?? model,
+      model: data.session?.model ?? model,
     });
   } catch (caughtError) {
     return NextResponse.json(

@@ -30,7 +30,7 @@ Create `.env.local`:
 ```bash
 OPENAI_API_KEY=your_openai_key
 # Optional override:
-OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
+OPENAI_REALTIME_MODEL=gpt-realtime
 ```
 
 ## Run Locally
@@ -44,11 +44,12 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## How It Works
 
-1. Frontend requests an ephemeral Realtime session from `app/api/realtime/session/route.ts`.
+1. Frontend requests an ephemeral Realtime client secret from `app/api/realtime/session/route.ts`.
 2. Browser connects directly to OpenAI Realtime using WebRTC + mic input.
-3. Transcript updates are captured in a rolling window.
-4. Client requests semantic chunk matching over the same Realtime data channel.
-5. Teleprompter advances or freezes based on confidence thresholds.
+3. A server sideband bootstrap call applies guardrails and truncation over `call_id`.
+4. Transcript updates are captured in a rolling window.
+5. Client requests semantic chunk matching as out-of-band responses to control token growth.
+6. Teleprompter advances or freezes based on confidence thresholds.
 
 ## Failure Handling
 

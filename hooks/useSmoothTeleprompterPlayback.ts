@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { limitToRange, SPEED_MAX, SPEED_MIN } from "@/lib/teleprompter/settings";
 
 type UseSmoothTeleprompterPlaybackParams = {
   targetTokenIndex: number;
@@ -9,10 +10,6 @@ type UseSmoothTeleprompterPlaybackParams = {
   isPlaying: boolean;
   frozen: boolean;
 };
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
 
 export function useSmoothTeleprompterPlayback({
   targetTokenIndex,
@@ -23,8 +20,31 @@ export function useSmoothTeleprompterPlayback({
 }: UseSmoothTeleprompterPlaybackParams): number {
   const [smoothedTokenIndex, setSmoothedTokenIndex] = useState(0);
   const smoothedRef = useRef(0);
+  const targetRef = useRef(targetTokenIndex);
+  const maxTokenIndexRef = useRef(maxTokenIndex);
+  const speedRef = useRef(speed);
   const rafRef = useRef<number | null>(null);
   const lastFrameAtRef = useRef(0);
+
+  useEffect(() => {
+    maxTokenIndexRef.current = maxTokenIndex;
+  }, [maxTokenIndex]);
+
+  useEffect(() => {
+    speedRef.current = speed;
+  }, [speed]);
+
+  // When the target decreases (e.g. readback restarted), snap the display
+  // position back immediately so the text is always in a known-good position.
+  useEffect(() => {
+    targetRef.current = targetTokenIndex;
+    if (targetTokenIndex < smoothedRef.current) {
+      smoothedRef.current = targetTokenIndex;
+      window.requestAnimationFrame(() => {
+        setSmoothedTokenIndex(targetTokenIndex);
+      });
+    }
+  }, [targetTokenIndex]);
 
   useEffect(() => {
     if (!isPlaying || frozen) {
@@ -35,10 +55,6 @@ export function useSmoothTeleprompterPlayback({
       return;
     }
 
-    const normalizedSpeed = clamp(speed, 1, 50);
-    const baseTokensPerSecond = 0.8 + normalizedSpeed * 0.08;
-    const stiffness = 2.8 + normalizedSpeed * 0.08;
-
     const tick = (now: number) => {
       if (lastFrameAtRef.current === 0) {
         lastFrameAtRef.current = now;
@@ -46,23 +62,47 @@ export function useSmoothTeleprompterPlayback({
       const elapsedSeconds = Math.min(0.1, (now - lastFrameAtRef.current) / 1000);
       lastFrameAtRef.current = now;
 
-      const target = clamp(targetTokenIndex, 0, Math.max(0, maxTokenIndex));
+      const target = limitToRange(
+        targetRef.current,
+        0,
+        Math.max(0, maxTokenIndexRef.current),
+      );
+
       if (target < smoothedRef.current) {
         smoothedRef.current = target;
         setSmoothedTokenIndex(target);
-      }
-      const gap = target - smoothedRef.current;
-      if (gap <= 0.0001) {
         rafRef.current = window.requestAnimationFrame(tick);
         return;
       }
 
-      const easedStep = gap * stiffness * elapsedSeconds;
-      const baseStep = baseTokensPerSecond * elapsedSeconds;
-      const next = clamp(smoothedRef.current + Math.min(gap, easedStep + baseStep), 0, target);
+      const gap = target - smoothedRef.current;
+      if (gap <= 0.001) {
+        if (smoothedRef.current !== target) {
+          smoothedRef.current = target;
+          setSmoothedTokenIndex(target);
+        }
+        rafRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
+
+      const normalizedSpeed = limitToRange(speedRef.current, SPEED_MIN, SPEED_MAX);
+      // Keep a predictable, bounded forward velocity for line-by-line smoothness.
+      const speedRatio =
+        (normalizedSpeed - SPEED_MIN) / Math.max(1, SPEED_MAX - SPEED_MIN);
+      const minTokensPerSecond = 0.9;
+      const maxTokensPerSecond = 10;
+      const tokensPerSecond =
+        minTokensPerSecond +
+        (maxTokensPerSecond - minTokensPerSecond) * speedRatio;
+      const next = limitToRange(
+        smoothedRef.current + Math.min(gap, tokensPerSecond * elapsedSeconds),
+        0,
+        target,
+      );
 
       smoothedRef.current = next;
       setSmoothedTokenIndex(next);
+
       rafRef.current = window.requestAnimationFrame(tick);
     };
 
@@ -75,7 +115,7 @@ export function useSmoothTeleprompterPlayback({
         rafRef.current = null;
       }
     };
-  }, [frozen, isPlaying, maxTokenIndex, speed, targetTokenIndex]);
+  }, [frozen, isPlaying]);
 
-  return clamp(smoothedTokenIndex, 0, Math.max(0, maxTokenIndex));
+  return limitToRange(smoothedTokenIndex, 0, Math.max(0, maxTokenIndex));
 }
