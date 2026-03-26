@@ -7,19 +7,25 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PromptViewport } from "@/components/teleprompter/PromptViewport";
 import { RangeSettingPopover } from "@/components/teleprompter/RangeSettingPopover";
 import { SurfacePanel } from "@/components/teleprompter/TeleprompterPrimitives";
+import { useBrowserSpeechRecognition } from "@/hooks/useBrowserSpeechRecognition";
 import { useDismissOnOutsideAndEscape } from "@/hooks/useDismissOnOutsideAndEscape";
 import { useOpenAIRealtime } from "@/hooks/useOpenAIRealtime";
 import { useSmoothTeleprompterPlayback } from "@/hooks/useSmoothTeleprompterPlayback";
-import { collectRollingWindow } from "@/lib/realtime/events";
+import {
+  collectRollingWindow,
+  type TranscriptUpdate,
+} from "@/lib/realtime/events";
 import {
   DEFAULT_MAX_LINES,
-  getWordsPerLineForTextSize,
+  getLineIndexForToken,
   getLineProgressForToken,
+  getWordsPerLineForTextSize,
   prepareScript,
 } from "@/lib/teleprompter/script";
 import {
   advanceCursorFromTranscript,
   buildAlignmentCandidates,
+  matchSpokenTokensFromTranscript,
   resolveAlignmentDecision,
 } from "@/lib/teleprompter/semanticAligner";
 import {
@@ -97,6 +103,55 @@ const KEYBOARD_SHORTCUTS: KeyboardShortcut[] = [
   { key: "Esc", action: "Close shortcuts", context: "When modal is open" },
 ];
 
+function normalizeTranscriptText(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function mergeTranscriptUpdates(
+  realtimeUpdates: TranscriptUpdate[],
+  browserUpdates: TranscriptUpdate[],
+): TranscriptUpdate[] {
+  const combined = [...realtimeUpdates, ...browserUpdates].sort(
+    (a, b) => a.createdAt - b.createdAt,
+  );
+  const next: TranscriptUpdate[] = [];
+
+  for (const update of combined) {
+    const normalized = normalizeTranscriptText(update.text);
+    if (!normalized) continue;
+
+    const last = next[next.length - 1];
+    if (!last) {
+      next.push(update);
+      continue;
+    }
+
+    const lastNormalized = normalizeTranscriptText(last.text);
+    const createdAtDelta = Math.abs(update.createdAt - last.createdAt);
+    const isNearDuplicate =
+      normalized === lastNormalized && createdAtDelta <= 900;
+    if (!isNearDuplicate) {
+      next.push(update);
+      continue;
+    }
+
+    // Keep a stronger signal when two engines emit the same near-simultaneous phrase.
+    if (last.kind === "partial" && update.kind === "final") {
+      next[next.length - 1] = update;
+      continue;
+    }
+    if (
+      last.kind === update.kind &&
+      update.id.startsWith("browser-") &&
+      !last.id.startsWith("browser-")
+    ) {
+      next[next.length - 1] = update;
+    }
+  }
+
+  return next.slice(-240);
+}
+
 export function TeleprompterApp() {
   const [mode, setMode] = useState<Mode>("compose");
   const [scriptInput, setScriptInput] = useState(() =>
@@ -104,8 +159,11 @@ export function TeleprompterApp() {
   );
   const [cursorTokenIndex, setCursorTokenIndex] = useState(0);
   const [speechScrollTokenIndex, setSpeechScrollTokenIndex] = useState(0);
+  const [spokenTokenIndices, setSpokenTokenIndices] = useState<Set<number>>(
+    () => new Set(),
+  );
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
-  const [readbackSettled, setReadbackSettled] = useState(false);
+  const [isSemanticallyPaused, setIsSemanticallyPaused] = useState(false);
   const [isFrozen, setIsFrozen] = useState(false);
   const [isRealtimeStalled, setIsRealtimeStalled] = useState(false);
   const [, setAlignmentConfidence] = useState(0);
@@ -118,8 +176,16 @@ export function TeleprompterApp() {
     number | null
   >(null);
 
+  const [isSpeechIdle, setIsSpeechIdle] = useState(false);
+
   const alignInFlightRef = useRef(false);
   const lastAlignedAtRef = useRef(0);
+  const lastAlignmentWindowRef = useRef("");
+  const lastAlignmentCursorRef = useRef(-1);
+  const spokenMatchCursorRef = useRef(0);
+  const lastSpeechAtRef = useRef(0);
+  const frozenAtTokenIndexRef = useRef(0);
+  const frozenAtTimestampRef = useRef(0);
   const speedControlRef = useRef<HTMLDivElement | null>(null);
   const textSizeControlRef = useRef<HTMLDivElement | null>(null);
   const textSizeToastTimeoutRef = useRef<number | null>(null);
@@ -127,12 +193,23 @@ export function TeleprompterApp() {
   const {
     status,
     error,
-    updates,
+    updates: realtimeUpdates,
     mediaStream,
     start,
     stop,
     requestSemanticAlignment,
   } = useOpenAIRealtime();
+
+  const {
+    updates: browserUpdates,
+    isSupported: isBrowserSpeechSupported,
+    clear: clearBrowserUpdates,
+  } = useBrowserSpeechRecognition({
+    language: "en-US",
+    enabled:
+      mode === "readback" &&
+      (status === "connecting" || status === "connected"),
+  });
 
   const wordsPerLine = useMemo(
     () => getWordsPerLineForTextSize(settings.textSize),
@@ -142,20 +219,38 @@ export function TeleprompterApp() {
     () => prepareScript(scriptInput, wordsPerLine),
     [scriptInput, wordsPerLine],
   );
+
+  const mergedUpdates = useMemo(
+    () => mergeTranscriptUpdates(realtimeUpdates, browserUpdates),
+    [browserUpdates, realtimeUpdates],
+  );
+  const latestBrowserAt =
+    browserUpdates[browserUpdates.length - 1]?.createdAt ?? 0;
+  const latestRealtimeAt =
+    realtimeUpdates[realtimeUpdates.length - 1]?.createdAt ?? 0;
+  const preferBrowserUpdates =
+    isBrowserSpeechSupported &&
+    latestBrowserAt > 0 &&
+    (latestRealtimeAt === 0 || latestBrowserAt >= latestRealtimeAt - 250);
+  const updates = preferBrowserUpdates ? browserUpdates : mergedUpdates;
   const rollingWindow = useMemo(
     () => collectRollingWindow(updates, 10_000),
     [updates],
   );
   const maxTokenIndex = Math.max(0, prepared.tokens.length - 1);
   const playbackFrozen =
-    isFrozen || isRealtimeStalled || isPlaybackPaused || status !== "connected";
+    isPlaybackPaused ||
+    status !== "connected" ||
+    isSpeechIdle ||
+    isSemanticallyPaused;
+  const alignmentFrozen = isFrozen || isRealtimeStalled;
   const smoothedTokenIndex = useSmoothTeleprompterPlayback({
     targetTokenIndex: speechScrollTokenIndex,
     maxTokenIndex,
     speed: settings.speed,
     isPlaying:
       mode === "readback" && status === "connected" && !isPlaybackPaused,
-    frozen: playbackFrozen,
+    frozen: playbackFrozen || alignmentFrozen,
   });
   const lineProgress = useMemo(
     () => getLineProgressForToken(prepared.lines, smoothedTokenIndex),
@@ -168,25 +263,73 @@ export function TeleprompterApp() {
     );
   }, [maxTokenIndex]);
 
-  // Hold the display at position 0 for a beat so the text is stable and
-  // fully visible before scrolling begins.
   useEffect(() => {
-    if (mode !== "readback") {
-      setReadbackSettled(false);
+    if (mode !== "readback" || isPlaybackPaused) {
       return;
     }
-    const timer = window.setTimeout(() => setReadbackSettled(true), 1000);
-    return () => window.clearTimeout(timer);
-  }, [mode]);
+    setSpeechScrollTokenIndex((previous) =>
+      Math.max(previous, cursorTokenIndex),
+    );
+  }, [cursorTokenIndex, isPlaybackPaused, mode]);
 
   useEffect(() => {
-    if (mode !== "readback" || isPlaybackPaused || !readbackSettled) {
+    if (
+      mode !== "readback" ||
+      status !== "connected" ||
+      isPlaybackPaused ||
+      alignmentFrozen ||
+      prepared.tokens.length === 0
+    ) {
       return;
     }
-    setSpeechScrollTokenIndex(cursorTokenIndex);
-  }, [cursorTokenIndex, isPlaybackPaused, mode, readbackSettled]);
+
+    const timer = window.setInterval(() => {
+      if (isSpeechIdle) return;
+      setSpeechScrollTokenIndex((previous) => {
+        const baseline = Math.max(previous, cursorTokenIndex);
+        if (baseline >= maxTokenIndex) {
+          return baseline;
+        }
+        return baseline + 1;
+      });
+    }, 450);
+
+    return () => window.clearInterval(timer);
+  }, [
+    alignmentFrozen,
+    cursorTokenIndex,
+    isPlaybackPaused,
+    isSpeechIdle,
+    maxTokenIndex,
+    mode,
+    prepared.tokens.length,
+    status,
+  ]);
 
   const latestTranscript = updates[updates.length - 1]?.text ?? "";
+
+  useEffect(() => {
+    if (updates.length > 0) {
+      lastSpeechAtRef.current =
+        updates[updates.length - 1]?.createdAt ?? Date.now();
+    }
+  }, [updates]);
+
+  useEffect(() => {
+    if (mode !== "readback" || status !== "connected") {
+      setIsSpeechIdle(false);
+      return;
+    }
+    const SILENCE_THRESHOLD_MS = 1_500;
+    const timer = window.setInterval(() => {
+      const elapsed = Date.now() - lastSpeechAtRef.current;
+      setIsSpeechIdle(
+        lastSpeechAtRef.current > 0 && elapsed > SILENCE_THRESHOLD_MS,
+      );
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [mode, status]);
+
   const closeSpeedControl = useCallback(() => {
     setIsSpeedControlOpen(false);
   }, []);
@@ -232,7 +375,21 @@ export function TeleprompterApp() {
     }
 
     const now = Date.now();
-    if (now - lastAlignedAtRef.current < 500) {
+    if (now - lastAlignedAtRef.current < 450) {
+      return;
+    }
+
+    const normalizedWindow = rollingWindow.trim();
+    if (!normalizedWindow) {
+      return;
+    }
+    const cursorDelta = Math.abs(
+      cursorTokenIndex - lastAlignmentCursorRef.current,
+    );
+    if (
+      normalizedWindow === lastAlignmentWindowRef.current &&
+      cursorDelta <= 2
+    ) {
       return;
     }
 
@@ -247,6 +404,8 @@ export function TeleprompterApp() {
 
     alignInFlightRef.current = true;
     lastAlignedAtRef.current = now;
+    lastAlignmentWindowRef.current = normalizedWindow;
+    lastAlignmentCursorRef.current = cursorTokenIndex;
 
     try {
       const modelResponse = await requestSemanticAlignment(
@@ -263,6 +422,7 @@ export function TeleprompterApp() {
 
       setAlignmentConfidence(decision.confidence);
       setIsFrozen(decision.freeze);
+      setIsSemanticallyPaused(decision.freeze);
 
       setCursorTokenIndex((previous) => {
         if (decision.nextTokenIndex <= previous) {
@@ -289,9 +449,17 @@ export function TeleprompterApp() {
     }
     setCursorTokenIndex(0);
     setSpeechScrollTokenIndex(0);
+    setSpokenTokenIndices(new Set());
+    spokenMatchCursorRef.current = 0;
     setIsPlaybackPaused(false);
+    setIsSemanticallyPaused(false);
     setAlignmentConfidence(0);
     setIsFrozen(false);
+    clearBrowserUpdates();
+    lastSpeechAtRef.current = 0;
+    frozenAtTokenIndexRef.current = 0;
+    frozenAtTimestampRef.current = 0;
+    setIsSpeechIdle(false);
     setMode("readback");
     await start();
   };
@@ -300,6 +468,9 @@ export function TeleprompterApp() {
     stop();
     setSpeechScrollTokenIndex(0);
     setIsPlaybackPaused(false);
+    setIsSemanticallyPaused(false);
+    setSpokenTokenIndices(new Set());
+    spokenMatchCursorRef.current = 0;
     setMode("compose");
   };
 
@@ -344,6 +515,12 @@ export function TeleprompterApp() {
 
   useEffect(() => {
     if (mode !== "readback" || status !== "connected") {
+      setIsSemanticallyPaused(false);
+    }
+  }, [mode, status]);
+
+  useEffect(() => {
+    if (mode !== "readback" || status !== "connected" || isFrozen) {
       return;
     }
 
@@ -356,9 +533,76 @@ export function TeleprompterApp() {
         currentTokenIndex: previous,
         transcriptWindow: rollingWindow,
         scriptTokens: prepared.tokens,
+        maxAdvancePerTick: 24,
+        maxLookahead: 64,
       }),
     );
-  }, [mode, prepared.tokens, rollingWindow, status]);
+  }, [isFrozen, mode, prepared.tokens, rollingWindow, status]);
+
+  useEffect(() => {
+    if (mode !== "readback" || status !== "connected") {
+      return;
+    }
+
+    if (alignmentFrozen || isSemanticallyPaused) {
+      return;
+    }
+
+    if (!rollingWindow.trim() || prepared.tokens.length === 0) {
+      return;
+    }
+
+    const anchor = Math.max(
+      spokenMatchCursorRef.current,
+      Math.max(0, cursorTokenIndex - 6),
+    );
+    const { nextTokenIndex, matchedTokenIndices } =
+      matchSpokenTokensFromTranscript({
+        currentTokenIndex: anchor,
+        transcriptWindow: rollingWindow,
+        scriptTokens: prepared.tokens,
+        maxMatchesPerTick: 32,
+        // Keep spoken highlights locally in sequence to avoid jumping lines.
+        maxLookahead: 14,
+      });
+
+    const currentLineIndex = getLineIndexForToken(
+      prepared.lines,
+      cursorTokenIndex,
+    );
+    const filteredMatches = matchedTokenIndices.filter((tokenIndex) => {
+      if (tokenIndex < Math.max(0, cursorTokenIndex - 3)) {
+        return false;
+      }
+      const tokenLineIndex = getLineIndexForToken(prepared.lines, tokenIndex);
+      return tokenLineIndex <= currentLineIndex + 1;
+    });
+
+    if (filteredMatches.length > 0) {
+      setSpokenTokenIndices((previous) => {
+        const next = new Set(previous);
+        for (const idx of filteredMatches) {
+          next.add(idx);
+        }
+        return next;
+      });
+    }
+    spokenMatchCursorRef.current = Math.max(
+      spokenMatchCursorRef.current,
+      filteredMatches.length > 0
+        ? filteredMatches[filteredMatches.length - 1] + 1
+        : nextTokenIndex,
+    );
+  }, [
+    alignmentFrozen,
+    cursorTokenIndex,
+    isSemanticallyPaused,
+    mode,
+    prepared.lines,
+    prepared.tokens,
+    rollingWindow,
+    status,
+  ]);
 
   useEffect(() => {
     if (mode !== "readback" || status !== "connected") {
@@ -377,6 +621,50 @@ export function TeleprompterApp() {
 
     return () => window.clearInterval(timer);
   }, [mode, status, updates]);
+
+  useEffect(() => {
+    if (isFrozen) {
+      frozenAtTokenIndexRef.current = cursorTokenIndex;
+      frozenAtTimestampRef.current = Date.now();
+    }
+  }, [isFrozen, cursorTokenIndex]);
+
+  useEffect(() => {
+    if (!isFrozen || mode !== "readback" || status !== "connected") {
+      return;
+    }
+    if (prepared.tokens.length === 0) {
+      return;
+    }
+
+    const postFreezeText = updates
+      .filter((u) => u.createdAt >= frozenAtTimestampRef.current)
+      .map((u) => u.text.trim())
+      .filter(Boolean)
+      .join(" ");
+
+    if (!postFreezeText.trim()) {
+      return;
+    }
+
+    const probeResult = advanceCursorFromTranscript({
+      currentTokenIndex: frozenAtTokenIndexRef.current,
+      transcriptWindow: postFreezeText,
+      scriptTokens: prepared.tokens,
+      maxAdvancePerTick: 24,
+      maxLookahead: 64,
+    });
+
+    if (probeResult > frozenAtTokenIndexRef.current + 1) {
+      setIsFrozen(false);
+      setIsSemanticallyPaused(false);
+      setCursorTokenIndex((previous) => Math.max(previous, probeResult));
+      spokenMatchCursorRef.current = Math.max(
+        spokenMatchCursorRef.current,
+        probeResult,
+      );
+    }
+  }, [isFrozen, mode, prepared.tokens, status, updates]);
 
   useEffect(() => {
     if (mode !== "readback") {
@@ -561,7 +849,9 @@ export function TeleprompterApp() {
                   <RangeSettingPopover
                     rootRef={speedControlRef}
                     triggerLabel="Speed"
-                    triggerIcon={<Gauge className="h-[20px] w-[20px]" aria-hidden="true" />}
+                    triggerIcon={
+                      <Gauge className="h-[20px] w-[20px]" aria-hidden="true" />
+                    }
                     compact
                     triggerAriaLabel={`Set speed, current ${settings.speed}`}
                     popoverId="speed-control-popover"
@@ -628,7 +918,10 @@ export function TeleprompterApp() {
                     rootRef={textSizeControlRef}
                     triggerLabel="Text size"
                     triggerIcon={
-                      <ALargeSmall className="h-[20px] w-[20px]" aria-hidden="true" />
+                      <ALargeSmall
+                        className="h-[20px] w-[20px]"
+                        aria-hidden="true"
+                      />
                     }
                     compact
                     triggerAriaLabel={`Set text size, current ${settings.textSize}`}
@@ -646,7 +939,11 @@ export function TeleprompterApp() {
                     onRangeChange={(value) =>
                       setSettings((previous) => ({
                         ...previous,
-                        textSize: limitToRange(value, TEXT_SIZE_MIN, TEXT_SIZE_MAX),
+                        textSize: limitToRange(
+                          value,
+                          TEXT_SIZE_MIN,
+                          TEXT_SIZE_MAX,
+                        ),
                       }))
                     }
                     onStepDown={() =>
@@ -729,8 +1026,9 @@ export function TeleprompterApp() {
               <PromptViewport
                 lines={prepared.lines}
                 currentLineProgress={lineProgress}
-                spokenTokenIndex={Math.floor(cursorTokenIndex)}
-                frozen={playbackFrozen}
+                currentTokenIndex={Math.floor(smoothedTokenIndex)}
+                spokenTokenIndices={spokenTokenIndices}
+                frozen={alignmentFrozen || playbackFrozen}
                 mediaStream={mediaStream}
                 maxVisibleRows={DEFAULT_MAX_LINES}
                 textSize={settings.textSize}
@@ -741,6 +1039,9 @@ export function TeleprompterApp() {
               <SurfacePanel className="p-4">
                 <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-400">
                   Rolling transcript (last ~10s)
+                  {isBrowserSpeechSupported
+                    ? " · hybrid browser + realtime"
+                    : " · realtime only"}
                 </h2>
                 <p className="min-h-16 text-sm leading-6 text-zinc-300">
                   {rollingWindow || latestTranscript || "Listening..."}

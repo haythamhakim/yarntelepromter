@@ -243,6 +243,73 @@ export function resolveAlignmentDecision(params: {
   };
 }
 
+export function matchSpokenTokensFromTranscript(params: {
+  currentTokenIndex: number;
+  transcriptWindow: string;
+  scriptTokens: ScriptToken[];
+  maxLookahead?: number;
+  maxMatchesPerTick?: number;
+}): { nextTokenIndex: number; matchedTokenIndices: number[] } {
+  const {
+    currentTokenIndex,
+    transcriptWindow,
+    scriptTokens,
+    maxLookahead = 36,
+    maxMatchesPerTick = 24,
+  } = params;
+
+  if (scriptTokens.length === 0) {
+    return { nextTokenIndex: 0, matchedTokenIndices: [] };
+  }
+
+  const safeCurrentIndex = Math.max(
+    0,
+    Math.min(currentTokenIndex, scriptTokens.length - 1),
+  );
+  const spokenWords = cleanTranscriptWindow(transcriptWindow)
+    .split(" ")
+    .filter(Boolean);
+  if (spokenWords.length === 0) {
+    return { nextTokenIndex: safeCurrentIndex, matchedTokenIndices: [] };
+  }
+
+  let nextCursor = safeCurrentIndex;
+  const matchedTokenIndices: number[] = [];
+
+  for (const spoken of spokenWords) {
+    if (
+      matchedTokenIndices.length >= maxMatchesPerTick ||
+      nextCursor >= scriptTokens.length
+    ) {
+      break;
+    }
+
+    const isWeak = spoken.length <= 2 || WEAK_MATCH_WORDS.has(spoken);
+    const lookaheadForWord = isWeak ? 4 : maxLookahead;
+    const searchEnd = Math.min(
+      scriptTokens.length - 1,
+      nextCursor + lookaheadForWord,
+    );
+
+    let matchedIndex = -1;
+    for (let scan = nextCursor; scan <= searchEnd; scan += 1) {
+      if (scriptTokens[scan].normalized === spoken) {
+        matchedIndex = scan;
+        break;
+      }
+    }
+
+    if (matchedIndex === -1) {
+      continue;
+    }
+
+    matchedTokenIndices.push(matchedIndex);
+    nextCursor = Math.min(matchedIndex + 1, scriptTokens.length);
+  }
+
+  return { nextTokenIndex: Math.max(safeCurrentIndex, nextCursor), matchedTokenIndices };
+}
+
 export function advanceCursorFromTranscript(params: {
   currentTokenIndex: number;
   transcriptWindow: string;
@@ -254,8 +321,8 @@ export function advanceCursorFromTranscript(params: {
     currentTokenIndex,
     transcriptWindow,
     scriptTokens,
-    maxLookahead = 48,
-    maxAdvancePerTick = 8,
+    maxLookahead = 36,
+    maxAdvancePerTick = 12,
   } = params;
 
   if (scriptTokens.length === 0) {
@@ -268,76 +335,36 @@ export function advanceCursorFromTranscript(params: {
     return safeCurrentIndex;
   }
 
-  const endOfSearch = Math.min(safeCurrentIndex + maxLookahead, scriptTokens.length);
-  const upcoming = scriptTokens.slice(safeCurrentIndex, endOfSearch);
-  if (upcoming.length === 0) {
-    return safeCurrentIndex;
-  }
-
-  let bestRunEnd = 0;
-  let scriptPointer = 0;
-  let strongWordMatches = 0;
+  let nextCursor = safeCurrentIndex;
+  let advanced = 0;
 
   for (const spoken of spokenWords) {
-    if (scriptPointer >= upcoming.length) break;
-    const weakSpoken = spoken.length <= 2 || WEAK_MATCH_WORDS.has(spoken);
-
-    if (spoken === upcoming[scriptPointer].normalized) {
-      scriptPointer += 1;
-      bestRunEnd = scriptPointer;
-      if (!weakSpoken) {
-        strongWordMatches += 1;
-      }
-      continue;
+    if (advanced >= maxAdvancePerTick || nextCursor >= scriptTokens.length - 1) {
+      break;
     }
 
-    const scanAhead = bestRunEnd === 0 ? 20 : 5;
-    for (
-      let scan = scriptPointer + 1;
-      scan < Math.min(scriptPointer + scanAhead, upcoming.length);
-      scan += 1
-    ) {
-      if (spoken === upcoming[scan].normalized) {
-        scriptPointer = scan + 1;
-        bestRunEnd = scriptPointer;
-        if (!weakSpoken) {
-          strongWordMatches += 1;
-        }
+    const isWeak = spoken.length <= 2 || WEAK_MATCH_WORDS.has(spoken);
+    const lookaheadForWord = isWeak ? 4 : maxLookahead;
+    const searchEnd = Math.min(scriptTokens.length - 1, nextCursor + lookaheadForWord);
+
+    let matchedIndex = -1;
+    for (let scan = nextCursor; scan <= searchEnd; scan += 1) {
+      if (scriptTokens[scan].normalized === spoken) {
+        matchedIndex = scan;
         break;
       }
     }
-  }
 
-  if (bestRunEnd === 0) {
-    const strongSpoken = spokenWords.filter(
-      (word) => word.length > 2 && !WEAK_MATCH_WORDS.has(word),
-    );
-    const strongSpokenSet = new Set(strongSpoken);
-    if (strongSpokenSet.size === 0) {
-      return safeCurrentIndex;
+    if (matchedIndex === -1) {
+      continue;
     }
 
-    let hitCount = 0;
-    let lastHitIndex = 0;
-    for (let i = 0; i < upcoming.length; i += 1) {
-      if (strongSpokenSet.has(upcoming[i].normalized)) {
-        hitCount += 1;
-        lastHitIndex = i + 1;
-      }
-    }
-    if (hitCount >= 2) {
-      const denseEnough = hitCount / Math.max(1, Math.min(upcoming.length, 12)) >= 0.25;
-      if (denseEnough) {
-        bestRunEnd = Math.min(lastHitIndex, maxAdvancePerTick);
-        strongWordMatches = hitCount;
-      }
+    const nextWordCursor = Math.min(matchedIndex + 1, scriptTokens.length - 1);
+    if (nextWordCursor > nextCursor) {
+      advanced += nextWordCursor - nextCursor;
+      nextCursor = nextWordCursor;
     }
   }
 
-  if (bestRunEnd === 0 || strongWordMatches === 0) {
-    return safeCurrentIndex;
-  }
-
-  const advance = Math.min(bestRunEnd, maxAdvancePerTick);
-  return Math.min(safeCurrentIndex + advance, Math.max(0, scriptTokens.length - 1));
+  return Math.max(safeCurrentIndex, nextCursor);
 }

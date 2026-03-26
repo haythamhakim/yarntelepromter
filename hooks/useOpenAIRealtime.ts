@@ -3,29 +3,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  DEFAULT_TRANSCRIPTION_LANGUAGE,
+  DEFAULT_TRANSCRIPTION_MODEL,
+} from "@/lib/realtime/config";
+import {
   eventToTranscriptUpdate,
   extractRealtimeAlignmentDoneText,
   extractRealtimeAlignmentTextDelta,
   extractRealtimeErrorMessage,
   hasRealtimeAudioContent,
-  isRealtimeInputSpeechStartedEvent,
   isRealtimeAlignmentTextDeltaEvent,
   isRealtimeAlignmentTextDoneEvent,
+  isRealtimeErrorEvent,
+  isRealtimeInputSpeechStartedEvent,
   isRealtimeOutputItemAddedEvent,
   isRealtimeOutputItemDoneEvent,
   isRealtimeRateLimitsUpdatedEvent,
   isRealtimeResponseCreatedEvent,
   isRealtimeResponseDoneEvent,
   isRealtimeResponseInterruptedEvent,
-  isRealtimeErrorEvent,
   isRealtimeTranscriptionCompletedEvent,
   safeParseRealtimeEvent,
   type TranscriptUpdate,
 } from "@/lib/realtime/events";
-import {
-  DEFAULT_TRANSCRIPTION_LANGUAGE,
-  DEFAULT_TRANSCRIPTION_MODEL,
-} from "@/lib/realtime/config";
 import {
   buildAlignmentPrompt,
   parseAlignmentResponse,
@@ -64,8 +64,6 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
   const [error, setError] = useState<string | null>(null);
   const [updates, setUpdates] = useState<TranscriptUpdate[]>([]);
   const [speechLevel, setSpeechLevel] = useState(0);
-  const [lastEventType, setLastEventType] = useState<string>("");
-  const [eventCount, setEventCount] = useState(0);
   const [usage, setUsage] = useState<UsageSnapshot>({
     responseCount: 0,
     totalTokens: 0,
@@ -74,7 +72,8 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
     cachedInputTokens: 0,
     transcriptionAudioTokens: 0,
   });
-  const [latestRateLimits, setLatestRateLimits] = useState<RateLimitSnapshot | null>(null);
+  const [latestRateLimits, setLatestRateLimits] =
+    useState<RateLimitSnapshot | null>(null);
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -85,7 +84,9 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
   const analyserDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const levelRafRef = useRef<number | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const alignmentResolverRef = useRef<((value: AlignmentResponse | null) => void) | null>(null);
+  const alignmentResolverRef = useRef<
+    ((value: AlignmentResponse | null) => void) | null
+  >(null);
   const alignmentTextBufferRef = useRef<string>("");
   const alignmentResponseInFlightRef = useRef(false);
   const alignmentResolveTimeoutRef = useRef<number | null>(null);
@@ -95,6 +96,7 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
   const activeResponseRef = useRef(false);
   const activeResponseItemIdRef = useRef<string | null>(null);
   const activeResponseHasAudioOutputRef = useRef(false);
+  const lastPartialUpdateAtRef = useRef(0);
 
   const clearAlignmentTimers = useCallback(() => {
     if (alignmentResolveTimeoutRef.current !== null) {
@@ -172,166 +174,197 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
     setMediaStream(null);
   }, [clearAlignmentTimers]);
 
-  const handleDataChannelMessage = useCallback((event: MessageEvent<unknown>) => {
-    const parsed = safeParseRealtimeEvent(typeof event.data === "string" ? event.data : "");
-    if (!parsed) {
-      return;
-    }
-    setLastEventType(parsed.type);
-    setEventCount((previous) => previous + 1);
-
-    if (process.env.NODE_ENV === "development") {
-      console.debug("[rt-event]", parsed.type, parsed);
-    }
-
-    if (isRealtimeErrorEvent(parsed)) {
-      const msg = extractRealtimeErrorMessage(parsed);
-      const normalized = msg.toLowerCase();
-      const isActiveResponseError =
-        normalized.includes("active response in progress") ||
-        normalized.includes("conversation already has an active response");
-      if (isActiveResponseError) {
-        if (process.env.NODE_ENV === "development") {
-          console.warn("[rt-warn] Active response already in progress. Skipping duplicate request.");
-        }
+  const handleDataChannelMessage = useCallback(
+    (event: MessageEvent<unknown>) => {
+      const parsed = safeParseRealtimeEvent(
+        typeof event.data === "string" ? event.data : "",
+      );
+      if (!parsed) {
         return;
       }
-      const sourceEvent = parsed.event_id
-        ? pendingClientEventsRef.current.get(parsed.event_id)
-        : undefined;
-      if (sourceEvent && parsed.event_id) {
-        pendingClientEventsRef.current.delete(parsed.event_id);
-      }
-      const decoratedMessage = sourceEvent
-        ? `${msg} (originated from "${sourceEvent}")`
-        : msg;
-      const isBenignInterruptionRace =
-        normalized.includes("cancellation failed: no active response found") ||
-        normalized.includes("only model output audio messages can be truncated");
-      if (isBenignInterruptionRace) {
-        if (process.env.NODE_ENV === "development") {
-          console.warn("[rt-warn]", decoratedMessage);
+
+      if (isRealtimeErrorEvent(parsed)) {
+        const msg = extractRealtimeErrorMessage(parsed);
+        const normalized = msg.toLowerCase();
+        const isActiveResponseError =
+          normalized.includes("active response in progress") ||
+          normalized.includes("conversation already has an active response");
+        if (isActiveResponseError) {
+          return;
         }
-        return;
-      }
-      console.error("[rt-error]", decoratedMessage);
-      setError(decoratedMessage);
-      return;
-    }
-
-    if (
-      isRealtimeInputSpeechStartedEvent(parsed) &&
-      activeResponseRef.current &&
-      activeResponseHasAudioOutputRef.current
-    ) {
-      const channel = dataChannelRef.current;
-      if (channel && channel.readyState === "open") {
-        channel.send(JSON.stringify({ type: "response.cancel" }));
-      }
-
-      if (activeResponseItemIdRef.current) {
-        if (channel && channel.readyState === "open") {
-          channel.send(
-            JSON.stringify({
-              type: "conversation.item.truncate",
-              item_id: activeResponseItemIdRef.current,
-              content_index: 0,
-              audio_end_ms: 0,
-            }),
+        const sourceEvent = parsed.event_id
+          ? pendingClientEventsRef.current.get(parsed.event_id)
+          : undefined;
+        if (sourceEvent && parsed.event_id) {
+          pendingClientEventsRef.current.delete(parsed.event_id);
+        }
+        const decoratedMessage = sourceEvent
+          ? `${msg} (originated from "${sourceEvent}")`
+          : msg;
+        const isBenignInterruptionRace =
+          normalized.includes(
+            "cancellation failed: no active response found",
+          ) ||
+          normalized.includes(
+            "only model output audio messages can be truncated",
           );
+        if (isBenignInterruptionRace) {
+          return;
+        }
+        setError(decoratedMessage);
+        return;
+      }
+
+      if (
+        isRealtimeInputSpeechStartedEvent(parsed) &&
+        activeResponseRef.current &&
+        activeResponseHasAudioOutputRef.current
+      ) {
+        const channel = dataChannelRef.current;
+        if (channel && channel.readyState === "open") {
+          channel.send(JSON.stringify({ type: "response.cancel" }));
+        }
+
+        if (activeResponseItemIdRef.current) {
+          if (channel && channel.readyState === "open") {
+            channel.send(
+              JSON.stringify({
+                type: "conversation.item.truncate",
+                item_id: activeResponseItemIdRef.current,
+                content_index: 0,
+                audio_end_ms: 0,
+              }),
+            );
+          }
         }
       }
-    }
 
-    if (isRealtimeResponseCreatedEvent(parsed)) {
-      activeResponseRef.current = true;
-      activeResponseHasAudioOutputRef.current = false;
-    }
-
-    if (isRealtimeOutputItemAddedEvent(parsed)) {
-      const itemId = parsed.item?.id;
-      if (itemId) {
-        activeResponseItemIdRef.current = itemId;
+      if (isRealtimeResponseCreatedEvent(parsed)) {
+        activeResponseRef.current = true;
+        activeResponseHasAudioOutputRef.current = false;
       }
-      if (hasRealtimeAudioContent(parsed.item)) {
-        activeResponseHasAudioOutputRef.current = true;
-      }
-    }
 
-    if (isRealtimeOutputItemDoneEvent(parsed)) {
-      const itemId = parsed.item?.id;
-      if (itemId && itemId === activeResponseItemIdRef.current) {
+      if (isRealtimeOutputItemAddedEvent(parsed)) {
+        const itemId = parsed.item?.id;
+        if (itemId) {
+          activeResponseItemIdRef.current = itemId;
+        }
+        if (hasRealtimeAudioContent(parsed.item)) {
+          activeResponseHasAudioOutputRef.current = true;
+        }
+      }
+
+      if (isRealtimeOutputItemDoneEvent(parsed)) {
+        const itemId = parsed.item?.id;
+        if (itemId && itemId === activeResponseItemIdRef.current) {
+          activeResponseItemIdRef.current = null;
+        }
+      }
+
+      if (isRealtimeResponseDoneEvent(parsed)) {
+        activeResponseRef.current = false;
         activeResponseItemIdRef.current = null;
+        activeResponseHasAudioOutputRef.current = false;
+        const usagePayload = parsed.response?.usage;
+        if (usagePayload) {
+          const cachedTokens =
+            usagePayload.input_token_details?.cached_tokens ?? 0;
+          setUsage((previous) => ({
+            responseCount: previous.responseCount + 1,
+            totalTokens:
+              previous.totalTokens + (usagePayload.total_tokens ?? 0),
+            inputTokens:
+              previous.inputTokens + (usagePayload.input_tokens ?? 0),
+            outputTokens:
+              previous.outputTokens + (usagePayload.output_tokens ?? 0),
+            cachedInputTokens: previous.cachedInputTokens + cachedTokens,
+            transcriptionAudioTokens: previous.transcriptionAudioTokens,
+          }));
+        }
       }
-    }
 
-    if (isRealtimeResponseDoneEvent(parsed)) {
-      activeResponseRef.current = false;
-      activeResponseItemIdRef.current = null;
-      activeResponseHasAudioOutputRef.current = false;
-      const usagePayload = parsed.response?.usage;
-      if (usagePayload) {
-        const cachedTokens = usagePayload.input_token_details?.cached_tokens ?? 0;
-        setUsage((previous) => ({
-          responseCount: previous.responseCount + 1,
-          totalTokens: previous.totalTokens + (usagePayload.total_tokens ?? 0),
-          inputTokens: previous.inputTokens + (usagePayload.input_tokens ?? 0),
-          outputTokens: previous.outputTokens + (usagePayload.output_tokens ?? 0),
-          cachedInputTokens: previous.cachedInputTokens + cachedTokens,
-          transcriptionAudioTokens: previous.transcriptionAudioTokens,
-        }));
+      if (isRealtimeResponseInterruptedEvent(parsed)) {
+        activeResponseRef.current = false;
+        activeResponseItemIdRef.current = null;
+        activeResponseHasAudioOutputRef.current = false;
       }
-    }
 
-    if (isRealtimeResponseInterruptedEvent(parsed)) {
-      activeResponseRef.current = false;
-      activeResponseItemIdRef.current = null;
-      activeResponseHasAudioOutputRef.current = false;
-    }
-
-    if (isRealtimeTranscriptionCompletedEvent(parsed)) {
-      const audioTokens = parsed.usage?.input_token_details?.audio_tokens ?? 0;
-      if (audioTokens > 0) {
-        setUsage((previous) => ({
-          ...previous,
-          transcriptionAudioTokens: previous.transcriptionAudioTokens + audioTokens,
-        }));
+      if (isRealtimeTranscriptionCompletedEvent(parsed)) {
+        const audioTokens =
+          parsed.usage?.input_token_details?.audio_tokens ?? 0;
+        if (audioTokens > 0) {
+          setUsage((previous) => ({
+            ...previous,
+            transcriptionAudioTokens:
+              previous.transcriptionAudioTokens + audioTokens,
+          }));
+        }
       }
-    }
 
-    if (isRealtimeRateLimitsUpdatedEvent(parsed)) {
-      setLatestRateLimits({
-        at: Date.now(),
-        details: parsed.rate_limits,
-      });
-    }
-
-    const transcriptUpdate = eventToTranscriptUpdate(parsed);
-    if (transcriptUpdate) {
-      setUpdates((previous) => [...previous.slice(-120), transcriptUpdate]);
-      return;
-    }
-
-    if (isRealtimeAlignmentTextDeltaEvent(parsed)) {
-      const delta = extractRealtimeAlignmentTextDelta(parsed);
-      alignmentTextBufferRef.current += delta;
-      return;
-    }
-
-    if (isRealtimeAlignmentTextDoneEvent(parsed)) {
-      const doneText = extractRealtimeAlignmentDoneText(parsed);
-      const combined = `${alignmentTextBufferRef.current}${doneText}`;
-      alignmentTextBufferRef.current = "";
-
-      const resolver = alignmentResolverRef.current;
-      if (resolver) {
-        clearAlignmentTimers();
-        alignmentResolverRef.current = null;
-        resolver(parseAlignmentResponse(combined));
+      if (isRealtimeRateLimitsUpdatedEvent(parsed)) {
+        setLatestRateLimits({
+          at: Date.now(),
+          details: parsed.rate_limits,
+        });
       }
-      alignmentResponseInFlightRef.current = false;
-    }
-  }, [clearAlignmentTimers]);
+
+      const transcriptUpdate = eventToTranscriptUpdate(parsed);
+      if (transcriptUpdate) {
+        const now = Date.now();
+        if (
+          transcriptUpdate.kind === "partial" &&
+          now - lastPartialUpdateAtRef.current < 5
+        ) {
+          return;
+        }
+        if (transcriptUpdate.kind === "partial") {
+          lastPartialUpdateAtRef.current = now;
+        }
+        setUpdates((previous) => {
+          const next = previous.slice(-120);
+          const last = next[next.length - 1];
+          if (transcriptUpdate.kind === "partial" && last?.kind === "partial") {
+            if (last.text === transcriptUpdate.text) {
+              return previous;
+            }
+            next[next.length - 1] = transcriptUpdate;
+            return next;
+          }
+          if (
+            last &&
+            last.kind === transcriptUpdate.kind &&
+            last.text === transcriptUpdate.text
+          ) {
+            return previous;
+          }
+          next.push(transcriptUpdate);
+          return next;
+        });
+        return;
+      }
+
+      if (isRealtimeAlignmentTextDeltaEvent(parsed)) {
+        const delta = extractRealtimeAlignmentTextDelta(parsed);
+        alignmentTextBufferRef.current += delta;
+        return;
+      }
+
+      if (isRealtimeAlignmentTextDoneEvent(parsed)) {
+        const doneText = extractRealtimeAlignmentDoneText(parsed);
+        const combined = `${alignmentTextBufferRef.current}${doneText}`;
+        alignmentTextBufferRef.current = "";
+
+        const resolver = alignmentResolverRef.current;
+        if (resolver) {
+          clearAlignmentTimers();
+          alignmentResolverRef.current = null;
+          resolver(parseAlignmentResponse(combined));
+        }
+        alignmentResponseInFlightRef.current = false;
+      }
+    },
+    [clearAlignmentTimers],
+  );
 
   const sendEvent = useCallback((payload: Record<string, unknown>) => {
     const channel = dataChannelRef.current;
@@ -349,7 +382,10 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
       event_id: eventId,
     };
 
-    pendingClientEventsRef.current.set(eventId, String(payload.type ?? "unknown"));
+    pendingClientEventsRef.current.set(
+      eventId,
+      String(payload.type ?? "unknown"),
+    );
     if (pendingClientEventsRef.current.size > 200) {
       const oldest = pendingClientEventsRef.current.keys().next().value;
       if (oldest) {
@@ -368,8 +404,6 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
     setStatus("connecting");
     setError(null);
     setUpdates([]);
-    setLastEventType("");
-    setEventCount(0);
     setLatestRateLimits(null);
     setUsage({
       responseCount: 0,
@@ -395,7 +429,8 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
         throw new Error("Unable to create Realtime session.");
       }
 
-      const { clientSecret, model } = (await sessionResponse.json()) as SessionResponse;
+      const { clientSecret, model } =
+        (await sessionResponse.json()) as SessionResponse;
       if (!clientSecret || !model) {
         throw new Error("Realtime session response is incomplete.");
       }
@@ -413,7 +448,9 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
       analyser.smoothingTimeConstant = 0.25;
       analyserRef.current = analyser;
       sourceNode.connect(analyser);
-      analyserDataRef.current = new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
+      analyserDataRef.current = new Uint8Array(
+        new ArrayBuffer(analyser.frequencyBinCount),
+      );
 
       const readLevel = () => {
         const activeAnalyser = analyserRef.current;
@@ -445,7 +482,9 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
         audio.autoplay = true;
       };
 
-      stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
+      stream
+        .getTracks()
+        .forEach((track) => peerConnection.addTrack(track, stream));
 
       const dataChannel = peerConnection.createDataChannel("oai-events");
       dataChannelRef.current = dataChannel;
@@ -460,7 +499,10 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
             audio: {
               input: {
                 turn_detection: {
-                  type: "semantic_vad",
+                  type: "server_vad",
+                  threshold: 0.35,
+                  prefix_padding_ms: 200,
+                  silence_duration_ms: 400,
                   create_response: false,
                   interrupt_response: true,
                 },
@@ -477,14 +519,17 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
 
-      const sdpResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${clientSecret}`,
-          "Content-Type": "application/sdp",
+      const sdpResponse = await fetch(
+        "https://api.openai.com/v1/realtime/calls",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${clientSecret}`,
+            "Content-Type": "application/sdp",
+          },
+          body: offer.sdp,
         },
-        body: offer.sdp,
-      });
+      );
 
       if (!sdpResponse.ok) {
         throw new Error("Failed to establish Realtime connection.");
@@ -508,9 +553,7 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
             callId,
             scriptLanguage,
           }),
-        }).catch(() => {
-          // Sideband hardening is best-effort. Core realtime flow should continue.
-        });
+        }).catch(() => {});
       }
     } catch (caughtError) {
       cleanup();
@@ -542,7 +585,10 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
         return null;
       }
 
-      if (alignmentResolverRef.current || alignmentResponseInFlightRef.current) {
+      if (
+        alignmentResolverRef.current ||
+        alignmentResponseInFlightRef.current
+      ) {
         return null;
       }
 
@@ -604,8 +650,6 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
     updates,
     speechLevel,
     mediaStream,
-    lastEventType,
-    eventCount,
     usage,
     latestRateLimits,
     start,

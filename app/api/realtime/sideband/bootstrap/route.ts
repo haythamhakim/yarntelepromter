@@ -81,7 +81,10 @@ export async function POST(request: Request) {
             audio: {
               input: {
                 turn_detection: {
-                  type: "semantic_vad",
+                  type: "server_vad",
+                  threshold: 0.35,
+                  prefix_padding_ms: 200,
+                  silence_duration_ms: 400,
                   create_response: false,
                   interrupt_response: true,
                 },
@@ -104,9 +107,7 @@ export async function POST(request: Request) {
           ws.close();
           settle({ ok: true });
         }
-      } catch {
-        // Ignore parse errors and continue waiting for a usable event.
-      }
+      } catch {}
     });
 
     ws.on("error", (error) => {
@@ -129,7 +130,6 @@ export async function POST(request: Request) {
   });
 
   if (!result.ok) {
-    console.warn("[sideband-bootstrap] Non-fatal sideband bootstrap failure:", result.error);
     return NextResponse.json(
       {
         ok: false,

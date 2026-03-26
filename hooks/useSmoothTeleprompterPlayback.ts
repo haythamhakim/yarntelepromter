@@ -1,7 +1,11 @@
 "use client";
 
+import {
+  limitToRange,
+  SPEED_MAX,
+  SPEED_MIN,
+} from "@/lib/teleprompter/settings";
 import { useEffect, useRef, useState } from "react";
-import { limitToRange, SPEED_MAX, SPEED_MIN } from "@/lib/teleprompter/settings";
 
 type UseSmoothTeleprompterPlaybackParams = {
   targetTokenIndex: number;
@@ -34,8 +38,6 @@ export function useSmoothTeleprompterPlayback({
     speedRef.current = speed;
   }, [speed]);
 
-  // When the target decreases (e.g. readback restarted), snap the display
-  // position back immediately so the text is always in a known-good position.
   useEffect(() => {
     targetRef.current = targetTokenIndex;
     if (targetTokenIndex < smoothedRef.current) {
@@ -59,7 +61,10 @@ export function useSmoothTeleprompterPlayback({
       if (lastFrameAtRef.current === 0) {
         lastFrameAtRef.current = now;
       }
-      const elapsedSeconds = Math.min(0.1, (now - lastFrameAtRef.current) / 1000);
+      const elapsedSeconds = Math.min(
+        0.066,
+        (now - lastFrameAtRef.current) / 1000,
+      );
       lastFrameAtRef.current = now;
 
       const target = limitToRange(
@@ -76,7 +81,7 @@ export function useSmoothTeleprompterPlayback({
       }
 
       const gap = target - smoothedRef.current;
-      if (gap <= 0.001) {
+      if (gap <= 0.00001) {
         if (smoothedRef.current !== target) {
           smoothedRef.current = target;
           setSmoothedTokenIndex(target);
@@ -85,17 +90,23 @@ export function useSmoothTeleprompterPlayback({
         return;
       }
 
-      const normalizedSpeed = limitToRange(speedRef.current, SPEED_MIN, SPEED_MAX);
-      // Keep a predictable, bounded forward velocity for line-by-line smoothness.
+      const normalizedSpeed = limitToRange(
+        speedRef.current,
+        SPEED_MIN,
+        SPEED_MAX,
+      );
       const speedRatio =
         (normalizedSpeed - SPEED_MIN) / Math.max(1, SPEED_MAX - SPEED_MIN);
       const minTokensPerSecond = 0.9;
-      const maxTokensPerSecond = 10;
-      const tokensPerSecond =
+      const maxTokensPerSecond = 10.5;
+      const baseTokensPerSecond =
         minTokensPerSecond +
         (maxTokensPerSecond - minTokensPerSecond) * speedRatio;
+      // Avoid easing-to-stop near the target to prevent micro-pauses.
+      const catchUpMultiplier = 1 + Math.min(3.5, gap * 2.2);
+      const step = baseTokensPerSecond * catchUpMultiplier * elapsedSeconds;
       const next = limitToRange(
-        smoothedRef.current + Math.min(gap, tokensPerSecond * elapsedSeconds),
+        smoothedRef.current + Math.min(gap, step),
         0,
         target,
       );

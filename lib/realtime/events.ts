@@ -13,7 +13,14 @@ type RealtimeEventBase = {
 
 export type RealtimeErrorEvent = RealtimeEventBase & {
   type: "error";
-  error?: string | { message?: string; code?: string; type?: string; [key: string]: unknown };
+  error?:
+    | string
+    | {
+        message?: string;
+        code?: string;
+        type?: string;
+        [key: string]: unknown;
+      };
 };
 
 type TranscriptTextContainer = {
@@ -135,7 +142,9 @@ export type RealtimeEventEnvelope =
   | RealtimeOutputItemDoneEvent
   | RealtimeEventBase;
 
-export function safeParseRealtimeEvent(data: string): RealtimeEventEnvelope | null {
+export function safeParseRealtimeEvent(
+  data: string,
+): RealtimeEventEnvelope | null {
   try {
     const parsed = JSON.parse(data) as unknown;
     if (!parsed || typeof parsed !== "object") {
@@ -201,18 +210,24 @@ export function eventToTranscriptUpdate(
 
   const now = Date.now();
   const kind: "partial" | "final" =
-    event.type.endsWith(".completed") || event.type.endsWith(".done") || event.type.endsWith(".final")
+    event.type.endsWith(".completed") ||
+    event.type.endsWith(".done") ||
+    event.type.endsWith(".final")
       ? "final"
       : "partial";
 
   return { id: `${kind}-${now}`, text, kind, createdAt: now };
 }
 
-export function isTranscriptEvent(event: RealtimeEventEnvelope): event is RealtimeTranscriptEvent {
+export function isTranscriptEvent(
+  event: RealtimeEventEnvelope,
+): event is RealtimeTranscriptEvent {
   return event.type.includes("input_audio_transcription");
 }
 
-export function isRealtimeErrorEvent(event: RealtimeEventEnvelope): event is RealtimeErrorEvent {
+export function isRealtimeErrorEvent(
+  event: RealtimeEventEnvelope,
+): event is RealtimeErrorEvent {
   return event.type === "error";
 }
 
@@ -233,7 +248,10 @@ export function extractRealtimeErrorMessage(event: RealtimeErrorEvent): string {
 export function isRealtimeAlignmentTextDeltaEvent(
   event: RealtimeEventEnvelope,
 ): event is RealtimeResponseTextDeltaEvent {
-  return event.type === "response.output_text.delta" || event.type === "response.text.delta";
+  return (
+    event.type === "response.output_text.delta" ||
+    event.type === "response.text.delta"
+  );
 }
 
 export function isRealtimeAlignmentTextDoneEvent(
@@ -246,11 +264,15 @@ export function isRealtimeAlignmentTextDoneEvent(
   );
 }
 
-export function extractRealtimeAlignmentTextDelta(event: RealtimeResponseTextDeltaEvent): string {
+export function extractRealtimeAlignmentTextDelta(
+  event: RealtimeResponseTextDeltaEvent,
+): string {
   return typeof event.delta === "string" ? event.delta : "";
 }
 
-export function extractRealtimeAlignmentDoneText(event: RealtimeResponseTextDoneEvent): string {
+export function extractRealtimeAlignmentDoneText(
+  event: RealtimeResponseTextDoneEvent,
+): string {
   return typeof event.text === "string" ? event.text : "";
 }
 
@@ -319,7 +341,10 @@ export function hasRealtimeAudioContent(item: unknown): boolean {
       return false;
     }
     const contentType = (entry as { type?: unknown }).type;
-    return typeof contentType === "string" && contentType.toLowerCase().includes("audio");
+    return (
+      typeof contentType === "string" &&
+      contentType.toLowerCase().includes("audio")
+    );
   });
 }
 

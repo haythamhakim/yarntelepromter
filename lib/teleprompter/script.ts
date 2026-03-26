@@ -27,7 +27,7 @@ export type PreparedScript = {
 };
 
 export const DEFAULT_WORDS_PER_LINE = 5;
-export const DEFAULT_MAX_LINES = 4;
+export const DEFAULT_MAX_LINES = 3;
 
 const NORMALIZE_REGEX = /[^\p{L}\p{N}'-]+/gu;
 

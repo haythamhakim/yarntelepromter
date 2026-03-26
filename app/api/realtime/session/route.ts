@@ -45,7 +45,10 @@ export async function POST() {
                 rate: 24000,
               },
               turn_detection: {
-                type: "semantic_vad",
+                type: "server_vad",
+                threshold: 0.35,
+                prefix_padding_ms: 200,
+                silence_duration_ms: 400,
                 create_response: false,
                 interrupt_response: true,
               },

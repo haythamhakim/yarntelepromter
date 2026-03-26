@@ -1,5 +1,5 @@
 export const DEFAULT_REALTIME_MODEL = "gpt-realtime";
-export const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
+export const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 export const DEFAULT_TRANSCRIPTION_LANGUAGE = "en";
 export const DEFAULT_REALTIME_VOICE = "marin";
 

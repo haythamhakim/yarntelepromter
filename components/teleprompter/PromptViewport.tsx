@@ -4,8 +4,6 @@ import { memo, useEffect, useRef, useState } from "react";
 
 import type { ScriptLine } from "@/lib/teleprompter/script";
 
-/* ── Lightweight audio visualiser (replaces react-audio-visualize) ── */
-
 type LiveAudioVisualizerProps = {
   mediaStream: MediaStream;
   width: number | string;
@@ -140,15 +138,12 @@ const LiveAudioVisualizer = memo(function LiveAudioVisualizer({
   );
 });
 
-/* ── Prompt viewport ── */
-
-const DEFAULT_VIEWPORT_HEIGHT = 420;
-
 type PromptLineProps = {
   line: ScriptLine;
   isActive: boolean;
   isUpcoming: boolean;
-  spokenTokenIndex: number;
+  currentTokenIndex: number;
+  spokenTokenIndices: ReadonlySet<number>;
   rowHeight: number;
   textSize: number;
   textAlign: "left" | "center" | "right";
@@ -158,7 +153,8 @@ const PromptLine = memo(function PromptLine({
   line,
   isActive,
   isUpcoming,
-  spokenTokenIndex,
+  currentTokenIndex,
+  spokenTokenIndices,
   rowHeight,
   textSize,
   textAlign,
@@ -191,19 +187,18 @@ const PromptLine = memo(function PromptLine({
         ? line.text
         : lineTokens.map((token, tokenOffset) => {
             const tokenIndex = line.tokenStart + tokenOffset;
-            const isRead = tokenIndex < spokenTokenIndex;
-            const isCurrent = tokenIndex === spokenTokenIndex;
+            const isCurrent = tokenIndex === currentTokenIndex;
+            const isSpoken = spokenTokenIndices.has(tokenIndex);
+            const tokenClass = isCurrent
+              ? "text-sky-200"
+              : isSpoken
+                ? "text-emerald-400"
+                : "";
 
             return (
               <span
                 key={`${line.id}-${tokenIndex}`}
-                className={`mr-3 inline-block max-w-full break-all rounded px-1 ${
-                  isCurrent
-                    ? "text-sky-200"
-                    : isRead
-                      ? "text-emerald-400"
-                      : undefined
-                }`}
+                className={`mr-3 inline-block max-w-full break-all rounded px-1 ${tokenClass}`}
               >
                 {token}
               </span>
@@ -216,7 +211,8 @@ const PromptLine = memo(function PromptLine({
 type PromptViewportProps = {
   lines: ScriptLine[];
   currentLineProgress: number;
-  spokenTokenIndex: number;
+  currentTokenIndex: number;
+  spokenTokenIndices: ReadonlySet<number>;
   frozen: boolean;
   mediaStream?: MediaStream | null;
   maxVisibleRows: number;
@@ -228,7 +224,8 @@ type PromptViewportProps = {
 export const PromptViewport = memo(function PromptViewport({
   lines,
   currentLineProgress,
-  spokenTokenIndex,
+  currentTokenIndex,
+  spokenTokenIndices,
   frozen,
   mediaStream,
   maxVisibleRows,
@@ -237,27 +234,8 @@ export const PromptViewport = memo(function PromptViewport({
   className,
 }: PromptViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [containerHeight, setContainerHeight] = useState(
-    DEFAULT_VIEWPORT_HEIGHT,
-  );
-
-  useEffect(() => {
-    const element = containerRef.current;
-    if (!element) return;
-
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (entry) {
-        setContainerHeight(entry.contentRect.height);
-      }
-    });
-
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  const effectiveHeight = containerHeight || DEFAULT_VIEWPORT_HEIGHT;
-  const rowHeight = effectiveHeight / Math.max(1, maxVisibleRows);
+  const rowHeight = Math.max(80, textSize * 1.35 + 16);
+  const viewportHeight = rowHeight * Math.max(1, maxVisibleRows);
   const anchorRow = Math.max(0, Math.min(maxVisibleRows - 1, 2));
   const activeLineIndex = Math.max(
     0,
@@ -265,18 +243,63 @@ export const PromptViewport = memo(function PromptViewport({
   );
   const maxOffsetY = anchorRow * rowHeight;
   const minOffsetY = -Math.max(0, lines.length - maxVisibleRows) * rowHeight;
-  // Keep the active line near a stable anchor row to avoid downward "falling".
   const desiredOffsetY = (anchorRow - currentLineProgress) * rowHeight;
-  const scrollOffsetY = Math.max(minOffsetY, Math.min(desiredOffsetY, maxOffsetY));
+  const scrollOffsetY = Math.max(
+    minOffsetY,
+    Math.min(desiredOffsetY, maxOffsetY),
+  );
   const innerMinHeight = Math.max(lines.length, maxVisibleRows) * rowHeight;
+  const viewportShellHeight = viewportHeight + 344;
+  const [animatedOffsetY, setAnimatedOffsetY] = useState(scrollOffsetY);
+  const animatedOffsetRef = useRef(scrollOffsetY);
+  const targetOffsetRef = useRef(scrollOffsetY);
+
+  useEffect(() => {
+    targetOffsetRef.current = scrollOffsetY;
+  }, [scrollOffsetY]);
+
+  useEffect(() => {
+    let rafId = 0;
+    let lastFrameAt = 0;
+
+    const tick = (now: number) => {
+      if (lastFrameAt === 0) {
+        lastFrameAt = now;
+      }
+      const elapsedSeconds = Math.min(0.1, (now - lastFrameAt) / 1000);
+      lastFrameAt = now;
+
+      const target = targetOffsetRef.current;
+      const current = animatedOffsetRef.current;
+      const delta = target - current;
+
+      if (Math.abs(delta) > 0.2) {
+        const linesPerSecond = 0.9;
+        const pixelsPerSecond = rowHeight * linesPerSecond;
+        const maxStep = pixelsPerSecond * elapsedSeconds;
+        const step = Math.max(-maxStep, Math.min(maxStep, delta));
+        const next = current + step;
+        animatedOffsetRef.current = next;
+        setAnimatedOffsetY(next);
+      } else if (current !== target) {
+        animatedOffsetRef.current = target;
+        setAnimatedOffsetY(target);
+      }
+
+      rafId = window.requestAnimationFrame(tick);
+    };
+
+    rafId = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [rowHeight]);
 
   return (
     <section
-      className={`flex w-full flex-col rounded-2xl border border-zinc-700/80 bg-[#151515]/95 p-6 shadow-[0_18px_50px_-24px_rgba(0,0,0,0.55)] ring-1 ring-white/6 ${
+      className={`flex max-h-[800px] w-full flex-col overflow-hidden rounded-2xl border border-zinc-700/80 bg-[#151515]/95 p-6 shadow-[0_18px_50px_-24px_rgba(0,0,0,0.55)] ring-1 ring-white/6 ${
         className ?? ""
       }`}
     >
-      <div className="mb-3 flex items-center gap-3 rounded-xl border border-zinc-700/60 bg-zinc-900/80 px-3 py-2">
+      <div className="mb-3 flex w-full items-center gap-3 rounded-xl border border-zinc-700/60 bg-zinc-900/80 px-3 py-2">
         <span
           aria-label={frozen ? "Alignment paused" : "Following speech"}
           title={frozen ? "Alignment paused" : "Following speech"}
@@ -303,19 +326,24 @@ export const PromptViewport = memo(function PromptViewport({
         </div>
       </div>
 
-      <div className="mb-4 flex items-center justify-between">
-        <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-400">
+      <div className="mb-4 flex w-full items-center justify-between">
+        <h2 className=" uppercase tracking-[0.14em] text-zinc-400">
           Readback View
         </h2>
       </div>
 
       <div
         ref={containerRef}
-        className="relative min-h-0 flex-1 overflow-hidden rounded-2xl border border-zinc-700/60 bg-[#0E0E0E] p-5"
+        className="relative mx-auto min-h-0 w-full max-w-6xl flex-1 overflow-hidden rounded-2xl border border-zinc-700/60 bg-[#0E0E0E] p-5"
+        style={{
+          height: `${viewportShellHeight}px`,
+          minHeight: `${viewportShellHeight}px`,
+          maxHeight: `${viewportShellHeight}px`,
+        }}
       >
         <div
           style={{
-            transform: `translate3d(0, ${scrollOffsetY}px, 0)`,
+            transform: `translate3d(0, ${animatedOffsetY}px, 0)`,
             minHeight: `${innerMinHeight}px`,
           }}
         >
@@ -325,7 +353,8 @@ export const PromptViewport = memo(function PromptViewport({
               line={line}
               isActive={index === activeLineIndex}
               isUpcoming={index > activeLineIndex}
-              spokenTokenIndex={spokenTokenIndex}
+              currentTokenIndex={currentTokenIndex}
+              spokenTokenIndices={spokenTokenIndices}
               rowHeight={rowHeight}
               textSize={textSize}
               textAlign={textAlign}
