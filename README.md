@@ -63,4 +63,3 @@ Open [http://localhost:3000](http://localhost:3000).
 - Alignment cadence currently runs at about 500ms.
 - Rolling transcript window defaults to 10 seconds.
 - Freeze threshold and confidence behavior live in `lib/teleprompter/semanticAligner.ts`.
-- In development, lightweight alignment diagnostics are logged in the browser console.
