@@ -1,36 +1,65 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AI Teleprompter MVP
 
-## Getting Started
+Low-latency script readback teleprompter built with Next.js and OpenAI Realtime API.
 
-First, run the development server:
+## Features
+
+- Script editor with a `Read back Script` flow.
+- Teleprompter viewport tuned for readability:
+  - around 5 words per line
+  - max 4 lines visible
+  - large text and active line emphasis
+- Browser microphone capture streamed to OpenAI Realtime over WebRTC.
+- Rolling transcript window (~10 seconds) for alignment.
+- Semantic alignment loop:
+  - compares transcript window with current/next script chunks
+  - advances when confidence is high
+  - freezes when confidence drops (off-script/ad-lib)
+  - resumes when confidence recovers
+
+## Requirements
+
+- Node.js 20+
+- Chromium-based browser for MVP testing (Chrome/Edge)
+- OpenAI API key with Realtime access
+
+## Environment Variables
+
+Create `.env.local`:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+OPENAI_API_KEY=your_openai_key
+# Optional override:
+OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Run Locally
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm install
+npm run dev
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Open [http://localhost:3000](http://localhost:3000).
 
-## Learn More
+## How It Works
 
-To learn more about Next.js, take a look at the following resources:
+1. Frontend requests an ephemeral Realtime session from `app/api/realtime/session/route.ts`.
+2. Browser connects directly to OpenAI Realtime using WebRTC + mic input.
+3. Transcript updates are captured in a rolling window.
+4. Client requests semantic chunk matching over the same Realtime data channel.
+5. Teleprompter advances or freezes based on confidence thresholds.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Failure Handling
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- **Mic permission denied**: connection fails with visible error message.
+- **Session creation errors**: backend returns provider error details.
+- **Realtime disconnects**: user can pause/resume readback.
+- **Alignment uncertainty**: scroll freezes instead of jumping blindly.
 
-## Deploy on Vercel
+## Tuning Notes
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Alignment cadence currently runs at about 500ms.
+- Rolling transcript window defaults to 10 seconds.
+- Freeze threshold and confidence behavior live in `lib/teleprompter/semanticAligner.ts`.
+- In development, lightweight alignment diagnostics are logged in the browser console.
