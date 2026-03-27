@@ -30,7 +30,7 @@ Create `.env.local`:
 ```bash
 OPENAI_API_KEY=your_openai_key
 # Optional override:
-OPENAI_REALTIME_MODEL=gpt-realtime
+OPENAI_REALTIME_MODEL=gpt-4o-mini-realtime-preview
 ```
 
 ## Run Locally

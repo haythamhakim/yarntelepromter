@@ -7,11 +7,19 @@ import {
   DEFAULT_TRANSCRIPTION_MODEL,
   DEFAULT_TRUNCATION_CONFIG,
 } from "@/lib/realtime/config";
-import { buildRealtimeSessionInstructions } from "@/lib/realtime/prompt";
+import {
+  buildRealtimeSessionInstructions,
+  buildTranscriptionPrompt,
+} from "@/lib/realtime/prompt";
 
 export const runtime = "nodejs";
 
-export async function POST() {
+type SessionRequestBody = {
+  scriptLanguage?: unknown;
+  scriptText?: unknown;
+};
+
+export async function POST(request: Request) {
   const apiKey = process.env.OPENAI_API_KEY;
   const model = process.env.OPENAI_REALTIME_MODEL ?? DEFAULT_REALTIME_MODEL;
 
@@ -23,51 +31,72 @@ export async function POST() {
   }
 
   try {
-    const effectiveLanguage = DEFAULT_TRANSCRIPTION_LANGUAGE;
+    let parsedBody: SessionRequestBody = {};
+    try {
+      parsedBody = (await request.json()) as SessionRequestBody;
+    } catch {}
 
-    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        session: {
-          type: "realtime",
-          model,
-          output_modalities: ["text"],
-          instructions: buildRealtimeSessionInstructions(effectiveLanguage),
-          truncation: DEFAULT_TRUNCATION_CONFIG,
-          audio: {
-            input: {
-              format: {
-                type: "audio/pcm",
-                rate: 24000,
+    const effectiveLanguage = DEFAULT_TRANSCRIPTION_LANGUAGE;
+    const scriptText =
+      typeof parsedBody.scriptText === "string"
+        ? parsedBody.scriptText
+        : undefined;
+    const transcriptionPrompt = buildTranscriptionPrompt(scriptText);
+
+    const transcriptionConfig: Record<string, unknown> = {
+      model: DEFAULT_TRANSCRIPTION_MODEL,
+      language: effectiveLanguage,
+    };
+    if (transcriptionPrompt) {
+      transcriptionConfig.prompt = transcriptionPrompt;
+    }
+
+    const response = await fetch(
+      "https://api.openai.com/v1/realtime/client_secrets",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          session: {
+            type: "realtime",
+            model,
+            output_modalities: ["text"],
+            instructions: buildRealtimeSessionInstructions(
+              effectiveLanguage,
+              scriptText,
+            ),
+            truncation: DEFAULT_TRUNCATION_CONFIG,
+            audio: {
+              input: {
+                format: {
+                  type: "audio/pcm",
+                  rate: 24000,
+                },
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.35,
+                  prefix_padding_ms: 200,
+                  silence_duration_ms: 400,
+                  create_response: false,
+                  interrupt_response: true,
+                },
+                transcription: transcriptionConfig,
               },
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.35,
-                prefix_padding_ms: 200,
-                silence_duration_ms: 400,
-                create_response: false,
-                interrupt_response: true,
-              },
-              transcription: {
-                model: DEFAULT_TRANSCRIPTION_MODEL,
-                language: effectiveLanguage,
-              },
-            },
-            output: {
-              voice: DEFAULT_REALTIME_VOICE,
-              format: {
-                type: "audio/pcm",
-                rate: 24000,
+              output: {
+                voice: DEFAULT_REALTIME_VOICE,
+                format: {
+                  type: "audio/pcm",
+                  rate: 24000,
+                },
               },
             },
           },
-        },
-      }),
-    });
+        }),
+      },
+    );
 
     if (!response.ok) {
       const body = await response.text();
@@ -99,7 +128,8 @@ export async function POST() {
     return NextResponse.json(
       {
         error: "Unexpected failure while creating Realtime session.",
-        details: caughtError instanceof Error ? caughtError.message : "Unknown error",
+        details:
+          caughtError instanceof Error ? caughtError.message : "Unknown error",
       },
       { status: 500 },
     );

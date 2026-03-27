@@ -48,6 +48,11 @@ const WEAK_MATCH_WORDS = new Set([
   "your",
 ]);
 
+function shouldSkipLexicalMatchWord(word: string): boolean {
+  // Single-character transcript tokens (especially "a") are too noisy with rolling partials.
+  return word.length <= 1;
+}
+
 export type AlignmentCandidate = {
   id: string;
   text: string;
@@ -283,6 +288,9 @@ export function matchSpokenTokensFromTranscript(params: {
     ) {
       break;
     }
+    if (shouldSkipLexicalMatchWord(spoken)) {
+      continue;
+    }
 
     const isWeak = spoken.length <= 2 || WEAK_MATCH_WORDS.has(spoken);
     const lookaheadForWord = isWeak ? 4 : maxLookahead;
@@ -342,6 +350,9 @@ export function advanceCursorFromTranscript(params: {
     if (advanced >= maxAdvancePerTick || nextCursor >= scriptTokens.length - 1) {
       break;
     }
+    if (shouldSkipLexicalMatchWord(spoken)) {
+      continue;
+    }
 
     const isWeak = spoken.length <= 2 || WEAK_MATCH_WORDS.has(spoken);
     const lookaheadForWord = isWeak ? 4 : maxLookahead;
@@ -367,4 +378,53 @@ export function advanceCursorFromTranscript(params: {
   }
 
   return Math.max(safeCurrentIndex, nextCursor);
+}
+
+// ---------------------------------------------------------------------------
+// ChatGPT-based semantic word matching
+// ---------------------------------------------------------------------------
+
+export type SemanticMatchInput = { index: number; raw: string };
+
+export type SemanticMatchResult = {
+  matchedIndices: number[];
+  confidence: number;
+};
+
+export function buildSemanticMatchPrompt(
+  transcript: string,
+  tokens: SemanticMatchInput[],
+): string {
+  const cleaned = cleanTranscriptWindow(transcript);
+  const tokenList = tokens.map((t) => `${t.index}:"${t.raw}"`).join(", ");
+
+  return [
+    "Compare the spoken transcript to the numbered script tokens below.",
+    'Return ONLY a JSON object: {"matchedIndices":[...],"confidence":0.0-1.0}',
+    "Include indices for exact word matches AND semantic equivalents (e.g. \"growing\" matches \"growth\").",
+    "Ignore filler words (um, uh, like, you know). If nothing matches set matchedIndices to [] and confidence to 0.",
+    "",
+    `Transcript: "${cleaned || "(empty)"}"`,
+    `Script tokens: [${tokenList}]`,
+  ].join("\n");
+}
+
+export function parseSemanticMatchResponse(
+  rawText: string,
+): SemanticMatchResult | null {
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  try {
+    const parsed = JSON.parse(jsonMatch[0]) as Partial<SemanticMatchResult>;
+    const indices = Array.isArray(parsed.matchedIndices)
+      ? parsed.matchedIndices.filter(
+          (v): v is number => typeof v === "number" && Number.isFinite(v),
+        )
+      : [];
+    const confidence = Math.min(1, Math.max(0, Number(parsed.confidence ?? 0)));
+    return { matchedIndices: indices, confidence };
+  } catch {
+    return null;
+  }
 }

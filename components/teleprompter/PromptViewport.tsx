@@ -1,6 +1,7 @@
 "use client";
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import type { ScriptLine } from "@/lib/teleprompter/script";
 
@@ -208,12 +209,76 @@ const PromptLine = memo(function PromptLine({
   );
 });
 
+function StatusDot({
+  frozen,
+  frozenReason,
+}: {
+  frozen: boolean;
+  frozenReason: string;
+}) {
+  const dotRef = useRef<HTMLSpanElement>(null);
+  const [show, setShow] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+
+  const updatePos = useCallback(() => {
+    const el = dotRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    setPos({
+      x: rect.left + rect.width / 2,
+      y: rect.top,
+    });
+  }, []);
+
+  const onEnter = useCallback(() => {
+    if (!frozen) return;
+    updatePos();
+    setShow(true);
+  }, [frozen, updatePos]);
+
+  const onLeave = useCallback(() => setShow(false), []);
+
+  return (
+    <div className="inline-flex shrink-0">
+      <span
+        ref={dotRef}
+        aria-label={frozen ? frozenReason : "Following speech"}
+        tabIndex={frozen ? 0 : -1}
+        onMouseEnter={onEnter}
+        onFocus={onEnter}
+        onMouseLeave={onLeave}
+        onBlur={onLeave}
+        className={`h-3.5 w-3.5 rounded-full ${
+          frozen ? "bg-amber-400" : "bg-emerald-400"
+        }`}
+      />
+      {frozen && show
+        ? createPortal(
+            <span
+              role="tooltip"
+              className="pointer-events-none fixed z-9999 w-max max-w-72 rounded-md border border-zinc-600/80 bg-zinc-950/95 px-2.5 py-1.5 text-xs text-zinc-100 shadow-lg ring-1 ring-white/10"
+              style={{
+                top: pos.y - 8,
+                left: pos.x,
+                transform: "translate(-50%, -100%)",
+              }}
+            >
+              {frozenReason}
+            </span>,
+            document.body,
+          )
+        : null}
+    </div>
+  );
+}
+
 type PromptViewportProps = {
   lines: ScriptLine[];
   currentLineProgress: number;
   currentTokenIndex: number;
   spokenTokenIndices: ReadonlySet<number>;
   frozen: boolean;
+  frozenReason: string;
   mediaStream?: MediaStream | null;
   maxVisibleRows: number;
   textSize: number;
@@ -227,6 +292,7 @@ export const PromptViewport = memo(function PromptViewport({
   currentTokenIndex,
   spokenTokenIndices,
   frozen,
+  frozenReason,
   mediaStream,
   maxVisibleRows,
   textSize,
@@ -299,14 +365,8 @@ export const PromptViewport = memo(function PromptViewport({
         className ?? ""
       }`}
     >
-      <div className="mb-3 flex w-full items-center gap-3 rounded-xl border border-zinc-700/60 bg-zinc-900/80 px-3 py-2">
-        <span
-          aria-label={frozen ? "Alignment paused" : "Following speech"}
-          title={frozen ? "Alignment paused" : "Following speech"}
-          className={`h-3.5 w-3.5 shrink-0 rounded-full ${
-            frozen ? "bg-amber-400" : "bg-emerald-400"
-          }`}
-        />
+      <div className="mb-3 flex w-full items-center gap-3 overflow-visible rounded-xl border border-zinc-700/60 bg-zinc-900/80 px-3 py-2">
+        <StatusDot frozen={frozen} frozenReason={frozenReason} />
         <div className="flex h-6 flex-1 items-center justify-center">
           {mediaStream ? (
             <LiveAudioVisualizer

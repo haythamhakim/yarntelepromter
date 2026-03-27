@@ -1,7 +1,27 @@
-export function buildRealtimeSessionInstructions(scriptLanguage: string): string {
+const SCRIPT_PROMPT_MAX_CHARS = 4000;
+
+function truncateScriptForPrompt(scriptText: string): string {
+  const trimmed = scriptText.trim();
+  if (trimmed.length <= SCRIPT_PROMPT_MAX_CHARS) {
+    return trimmed;
+  }
+  return trimmed.slice(0, SCRIPT_PROMPT_MAX_CHARS) + "…";
+}
+
+export function buildTranscriptionPrompt(scriptText?: string): string | undefined {
+  if (!scriptText?.trim()) {
+    return undefined;
+  }
+  return truncateScriptForPrompt(scriptText);
+}
+
+export function buildRealtimeSessionInstructions(
+  scriptLanguage: string,
+  scriptText?: string,
+): string {
   const safeLanguage = scriptLanguage.trim().toLowerCase() || "en";
 
-  return [
+  const sections: string[] = [
     "# Role & Objective",
     "- You are a silent transcription assistant for an AI teleprompter.",
     "- Success means capturing accurate user speech and supporting alignment checks.",
@@ -22,5 +42,18 @@ export function buildRealtimeSessionInstructions(scriptLanguage: string): string
     "# Safety & Escalation",
     "- If user audio is unintelligible, provide a concise clarification phrase.",
     "- Do not provide medical, legal, or financial advice.",
-  ].join("\n");
+  ];
+
+  if (scriptText?.trim()) {
+    sections.push(
+      "",
+      "# Reference Script",
+      "The user is reading the following script aloud. Use it as context for alignment checks.",
+      "---",
+      truncateScriptForPrompt(scriptText),
+      "---",
+    );
+  }
+
+  return sections.join("\n");
 }

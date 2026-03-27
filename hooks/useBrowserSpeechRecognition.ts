@@ -38,6 +38,10 @@ type SpeechRecognitionInstance = {
 
 type SpeechRecognitionConstructor = new () => SpeechRecognitionInstance;
 
+function normalizeTranscriptText(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 function getConstructor(): SpeechRecognitionConstructor | null {
   if (typeof window === "undefined") return null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -92,11 +96,37 @@ export function useBrowserSpeechRecognition(
         const next = prev.slice(-120);
         for (const update of batch) {
           const last = next[next.length - 1];
+          const updateNormalized = normalizeTranscriptText(update.text);
+          const lastNormalized = last
+            ? normalizeTranscriptText(last.text)
+            : "";
+
           if (update.kind === "partial" && last?.kind === "partial") {
+            // Keep only the freshest partial hypothesis.
             next[next.length - 1] = update;
-          } else {
-            next.push(update);
+            continue;
           }
+
+          if (
+            last &&
+            last.kind === "partial" &&
+            update.kind === "final" &&
+            lastNormalized === updateNormalized
+          ) {
+            // Promote matching partial -> final instead of duplicating text.
+            next[next.length - 1] = update;
+            continue;
+          }
+
+          if (
+            last &&
+            last.kind === update.kind &&
+            lastNormalized === updateNormalized
+          ) {
+            continue;
+          }
+
+          next.push(update);
         }
         return next;
       });

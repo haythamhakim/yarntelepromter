@@ -56,10 +56,11 @@ type RateLimitSnapshot = {
 
 type UseOpenAIRealtimeOptions = {
   scriptLanguage?: string;
+  scriptText?: string;
 };
 
 export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
-  const { scriptLanguage = "en" } = options;
+  const { scriptLanguage = "en", scriptText } = options;
   const [status, setStatus] = useState<RealtimeStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [updates, setUpdates] = useState<TranscriptUpdate[]>([]);
@@ -281,6 +282,13 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
             transcriptionAudioTokens: previous.transcriptionAudioTokens,
           }));
         }
+
+        const metadata = parsed.response?.metadata as
+          | Record<string, unknown>
+          | undefined;
+        if (metadata?.topic === "alignment") {
+          alignmentResponseInFlightRef.current = false;
+        }
       }
 
       if (isRealtimeResponseInterruptedEvent(parsed)) {
@@ -422,6 +430,7 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
         },
         body: JSON.stringify({
           scriptLanguage,
+          scriptText,
         }),
       });
 
@@ -501,8 +510,8 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
                 turn_detection: {
                   type: "server_vad",
                   threshold: 0.35,
-                  prefix_padding_ms: 200,
-                  silence_duration_ms: 400,
+                  prefix_padding_ms: 350,
+                  silence_duration_ms: 700,
                   create_response: false,
                   interrupt_response: true,
                 },
@@ -552,6 +561,7 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
           body: JSON.stringify({
             callId,
             scriptLanguage,
+            scriptText,
           }),
         }).catch(() => {});
       }
@@ -564,7 +574,14 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
           : "Unexpected error while connecting to Realtime.",
       );
     }
-  }, [cleanup, handleDataChannelMessage, scriptLanguage, sendEvent, status]);
+  }, [
+    cleanup,
+    handleDataChannelMessage,
+    scriptLanguage,
+    scriptText,
+    sendEvent,
+    status,
+  ]);
 
   const stop = useCallback(() => {
     cleanup();
@@ -634,7 +651,7 @@ export function useOpenAIRealtime(options: UseOpenAIRealtimeOptions = {}) {
         alignmentInflightResetTimeoutRef.current = window.setTimeout(() => {
           alignmentResponseInFlightRef.current = false;
           alignmentInflightResetTimeoutRef.current = null;
-        }, 5000);
+        }, 2000);
       });
     },
     [clearAlignmentTimers, sendEvent],

@@ -7,12 +7,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PromptViewport } from "@/components/teleprompter/PromptViewport";
 import { RangeSettingPopover } from "@/components/teleprompter/RangeSettingPopover";
 import { SurfacePanel } from "@/components/teleprompter/TeleprompterPrimitives";
-import { useBrowserSpeechRecognition } from "@/hooks/useBrowserSpeechRecognition";
 import { useDismissOnOutsideAndEscape } from "@/hooks/useDismissOnOutsideAndEscape";
 import { useOpenAIRealtime } from "@/hooks/useOpenAIRealtime";
 import { useSmoothTeleprompterPlayback } from "@/hooks/useSmoothTeleprompterPlayback";
 import {
   collectRollingWindow,
+  extractLastSentence,
   type TranscriptUpdate,
 } from "@/lib/realtime/events";
 import {
@@ -25,8 +25,8 @@ import {
 import {
   advanceCursorFromTranscript,
   buildAlignmentCandidates,
-  matchSpokenTokensFromTranscript,
   resolveAlignmentDecision,
+  type SemanticMatchResult,
 } from "@/lib/teleprompter/semanticAligner";
 import {
   DEFAULT_SETTINGS,
@@ -107,16 +107,27 @@ function normalizeTranscriptText(text: string): string {
   return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function mergeTranscriptUpdates(
-  realtimeUpdates: TranscriptUpdate[],
-  browserUpdates: TranscriptUpdate[],
+function stripPunctuation(word: string): string {
+  return word.replace(/[^\w]/g, "").toLowerCase();
+}
+
+function isWordSubsequence(needle: string[], haystack: string[]): boolean {
+  const a = needle.map(stripPunctuation).filter(Boolean);
+  const b = haystack.map(stripPunctuation).filter(Boolean);
+  if (a.length === 0) return true;
+  let j = 0;
+  for (let i = 0; i < b.length && j < a.length; i++) {
+    if (b[i] === a[j]) j++;
+  }
+  return j === a.length;
+}
+
+function buildRealtimeSignalUpdates(
+  updates: TranscriptUpdate[],
 ): TranscriptUpdate[] {
-  const combined = [...realtimeUpdates, ...browserUpdates].sort(
-    (a, b) => a.createdAt - b.createdAt,
-  );
   const next: TranscriptUpdate[] = [];
 
-  for (const update of combined) {
+  for (const update of updates) {
     const normalized = normalizeTranscriptText(update.text);
     if (!normalized) continue;
 
@@ -130,23 +141,47 @@ function mergeTranscriptUpdates(
     const createdAtDelta = Math.abs(update.createdAt - last.createdAt);
     const isNearDuplicate =
       normalized === lastNormalized && createdAtDelta <= 900;
-    if (!isNearDuplicate) {
-      next.push(update);
+
+    if (update.kind === "partial" && last.kind === "partial") {
+      next[next.length - 1] = update;
       continue;
     }
 
-    // Keep a stronger signal when two engines emit the same near-simultaneous phrase.
     if (last.kind === "partial" && update.kind === "final") {
-      next[next.length - 1] = update;
+      if (
+        lastNormalized === normalized ||
+        normalized.includes(lastNormalized) ||
+        lastNormalized.includes(normalized)
+      ) {
+        next[next.length - 1] = update;
+        continue;
+      }
+    }
+
+    if (
+      last.kind === "final" &&
+      update.kind === "final" &&
+      createdAtDelta <= 2_000
+    ) {
+      const lastWords = lastNormalized.split(/\s+/);
+      const updateWords = normalized.split(/\s+/);
+      if (isWordSubsequence(lastWords, updateWords)) {
+        next[next.length - 1] = update;
+        continue;
+      }
+      if (isWordSubsequence(updateWords, lastWords)) {
+        continue;
+      }
+    }
+
+    if (isNearDuplicate) {
+      if (last.kind === "partial" && update.kind === "final") {
+        next[next.length - 1] = update;
+      }
       continue;
     }
-    if (
-      last.kind === update.kind &&
-      update.id.startsWith("browser-") &&
-      !last.id.startsWith("browser-")
-    ) {
-      next[next.length - 1] = update;
-    }
+
+    next.push(update);
   }
 
   return next.slice(-240);
@@ -163,7 +198,7 @@ export function TeleprompterApp() {
     () => new Set(),
   );
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
-  const [isSemanticallyPaused, setIsSemanticallyPaused] = useState(false);
+  const [isSemanticallyPaused, setIsSemanticallyPaused] = useState(true);
   const [isFrozen, setIsFrozen] = useState(false);
   const [isRealtimeStalled, setIsRealtimeStalled] = useState(false);
   const [, setAlignmentConfidence] = useState(0);
@@ -198,18 +233,7 @@ export function TeleprompterApp() {
     start,
     stop,
     requestSemanticAlignment,
-  } = useOpenAIRealtime();
-
-  const {
-    updates: browserUpdates,
-    isSupported: isBrowserSpeechSupported,
-    clear: clearBrowserUpdates,
-  } = useBrowserSpeechRecognition({
-    language: "en-US",
-    enabled:
-      mode === "readback" &&
-      (status === "connecting" || status === "connected"),
-  });
+  } = useOpenAIRealtime({ scriptText: scriptInput });
 
   const wordsPerLine = useMemo(
     () => getWordsPerLineForTextSize(settings.textSize),
@@ -220,30 +244,59 @@ export function TeleprompterApp() {
     [scriptInput, wordsPerLine],
   );
 
-  const mergedUpdates = useMemo(
-    () => mergeTranscriptUpdates(realtimeUpdates, browserUpdates),
-    [browserUpdates, realtimeUpdates],
+  const activityUpdates = realtimeUpdates;
+  const signalUpdates = useMemo(
+    () => buildRealtimeSignalUpdates(realtimeUpdates),
+    [realtimeUpdates],
   );
-  const latestBrowserAt =
-    browserUpdates[browserUpdates.length - 1]?.createdAt ?? 0;
-  const latestRealtimeAt =
-    realtimeUpdates[realtimeUpdates.length - 1]?.createdAt ?? 0;
-  const preferBrowserUpdates =
-    isBrowserSpeechSupported &&
-    latestBrowserAt > 0 &&
-    (latestRealtimeAt === 0 || latestBrowserAt >= latestRealtimeAt - 250);
-  const updates = preferBrowserUpdates ? browserUpdates : mergedUpdates;
   const rollingWindow = useMemo(
-    () => collectRollingWindow(updates, 10_000),
-    [updates],
+    () => collectRollingWindow(signalUpdates, 10_000),
+    [signalUpdates],
   );
+  const shortTranscript = useMemo(
+    () => extractLastSentence(rollingWindow),
+    [rollingWindow],
+  );
+  const semanticMatchAbortRef = useRef<AbortController | null>(null);
+  const lastSemanticMatchAtRef = useRef(0);
+  const lastSemanticTranscriptRef = useRef("");
   const maxTokenIndex = Math.max(0, prepared.tokens.length - 1);
   const playbackFrozen =
     isPlaybackPaused ||
     status !== "connected" ||
-    isSpeechIdle ||
-    isSemanticallyPaused;
+    isSpeechIdle;
   const alignmentFrozen = isFrozen || isRealtimeStalled;
+  const freezeReason = useMemo(() => {
+    if (!(playbackFrozen || alignmentFrozen)) {
+      return "Following speech";
+    }
+    if (status !== "connected") {
+      return status === "connecting"
+        ? "Connecting to realtime..."
+        : "Realtime is disconnected. Press play to reconnect.";
+    }
+    if (isPlaybackPaused) {
+      return "Playback is paused. Press play to continue.";
+    }
+    if (isRealtimeStalled) {
+      return "No transcript updates received recently.";
+    }
+    if (isSpeechIdle) {
+      return "No speech detected. Start speaking to continue.";
+    }
+    if (isFrozen) {
+      return "Off-script detected. Waiting to re-align with your script.";
+    }
+    return "Alignment paused.";
+  }, [
+    alignmentFrozen,
+    isFrozen,
+    isPlaybackPaused,
+    isRealtimeStalled,
+    isSpeechIdle,
+    playbackFrozen,
+    status,
+  ]);
   const smoothedTokenIndex = useSmoothTeleprompterPlayback({
     targetTokenIndex: speechScrollTokenIndex,
     maxTokenIndex,
@@ -306,21 +359,24 @@ export function TeleprompterApp() {
     status,
   ]);
 
-  const latestTranscript = updates[updates.length - 1]?.text ?? "";
+  const latestTranscript =
+    signalUpdates[signalUpdates.length - 1]?.text ??
+    activityUpdates[activityUpdates.length - 1]?.text ??
+    "";
 
   useEffect(() => {
-    if (updates.length > 0) {
+    if (activityUpdates.length > 0) {
       lastSpeechAtRef.current =
-        updates[updates.length - 1]?.createdAt ?? Date.now();
+        activityUpdates[activityUpdates.length - 1]?.createdAt ?? Date.now();
     }
-  }, [updates]);
+  }, [activityUpdates]);
 
   useEffect(() => {
     if (mode !== "readback" || status !== "connected") {
       setIsSpeechIdle(false);
       return;
     }
-    const SILENCE_THRESHOLD_MS = 1_500;
+    const SILENCE_THRESHOLD_MS = 3_000;
     const timer = window.setInterval(() => {
       const elapsed = Date.now() - lastSpeechAtRef.current;
       setIsSpeechIdle(
@@ -367,6 +423,7 @@ export function TeleprompterApp() {
     }
 
     if (prepared.tokens.length === 0 || rollingWindow.length < 8) {
+      setIsSemanticallyPaused(true);
       return;
     }
 
@@ -381,6 +438,7 @@ export function TeleprompterApp() {
 
     const normalizedWindow = rollingWindow.trim();
     if (!normalizedWindow) {
+      setIsSemanticallyPaused(true);
       return;
     }
     const cursorDelta = Math.abs(
@@ -399,6 +457,7 @@ export function TeleprompterApp() {
       4,
     );
     if (candidates.length === 0) {
+      setIsSemanticallyPaused(true);
       return;
     }
 
@@ -420,9 +479,10 @@ export function TeleprompterApp() {
         scriptTokens: prepared.tokens,
       });
 
+      const hasSemanticMatch = !decision.freeze && decision.confidence >= 0.38;
       setAlignmentConfidence(decision.confidence);
       setIsFrozen(decision.freeze);
-      setIsSemanticallyPaused(decision.freeze);
+      setIsSemanticallyPaused(!hasSemanticMatch);
 
       setCursorTokenIndex((previous) => {
         if (decision.nextTokenIndex <= previous) {
@@ -452,10 +512,9 @@ export function TeleprompterApp() {
     setSpokenTokenIndices(new Set());
     spokenMatchCursorRef.current = 0;
     setIsPlaybackPaused(false);
-    setIsSemanticallyPaused(false);
+    setIsSemanticallyPaused(true);
     setAlignmentConfidence(0);
     setIsFrozen(false);
-    clearBrowserUpdates();
     lastSpeechAtRef.current = 0;
     frozenAtTokenIndexRef.current = 0;
     frozenAtTimestampRef.current = 0;
@@ -533,8 +592,8 @@ export function TeleprompterApp() {
         currentTokenIndex: previous,
         transcriptWindow: rollingWindow,
         scriptTokens: prepared.tokens,
-        maxAdvancePerTick: 24,
-        maxLookahead: 64,
+        maxAdvancePerTick: 8,
+        maxLookahead: 24,
       }),
     );
   }, [isFrozen, mode, prepared.tokens, rollingWindow, status]);
@@ -543,56 +602,86 @@ export function TeleprompterApp() {
     if (mode !== "readback" || status !== "connected") {
       return;
     }
-
     if (alignmentFrozen || isSemanticallyPaused) {
       return;
     }
-
-    if (!rollingWindow.trim() || prepared.tokens.length === 0) {
+    if (!shortTranscript.trim() || prepared.tokens.length === 0) {
       return;
     }
 
-    const anchor = Math.max(
-      spokenMatchCursorRef.current,
-      Math.max(0, cursorTokenIndex - 6),
+    const now = Date.now();
+    if (now - lastSemanticMatchAtRef.current < 600) {
+      return;
+    }
+    if (shortTranscript === lastSemanticTranscriptRef.current) {
+      return;
+    }
+
+    const regionStart = Math.max(0, cursorTokenIndex - 3);
+    const regionEnd = Math.min(
+      prepared.tokens.length,
+      cursorTokenIndex + 30,
     );
-    const { nextTokenIndex, matchedTokenIndices } =
-      matchSpokenTokensFromTranscript({
-        currentTokenIndex: anchor,
-        transcriptWindow: rollingWindow,
-        scriptTokens: prepared.tokens,
-        maxMatchesPerTick: 32,
-        // Keep spoken highlights locally in sequence to avoid jumping lines.
-        maxLookahead: 14,
-      });
+    const regionTokens = prepared.tokens
+      .slice(regionStart, regionEnd)
+      .map((t) => ({ index: t.index, raw: t.raw }));
+
+    if (regionTokens.length === 0) {
+      return;
+    }
+
+    semanticMatchAbortRef.current?.abort();
+    const controller = new AbortController();
+    semanticMatchAbortRef.current = controller;
+    lastSemanticMatchAtRef.current = now;
+    lastSemanticTranscriptRef.current = shortTranscript;
 
     const currentLineIndex = getLineIndexForToken(
       prepared.lines,
       cursorTokenIndex,
     );
-    const filteredMatches = matchedTokenIndices.filter((tokenIndex) => {
-      if (tokenIndex < Math.max(0, cursorTokenIndex - 3)) {
-        return false;
-      }
-      const tokenLineIndex = getLineIndexForToken(prepared.lines, tokenIndex);
-      return tokenLineIndex <= currentLineIndex + 1;
-    });
 
-    if (filteredMatches.length > 0) {
-      setSpokenTokenIndices((previous) => {
-        const next = new Set(previous);
-        for (const idx of filteredMatches) {
-          next.add(idx);
+    void (async () => {
+      try {
+        const response = await fetch("/api/alignment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript: shortTranscript,
+            scriptTokens: regionTokens,
+          }),
+          signal: controller.signal,
+        });
+        if (!response.ok || controller.signal.aborted) return;
+
+        const data = (await response.json()) as SemanticMatchResult;
+        if (controller.signal.aborted) return;
+
+        const filtered = (data.matchedIndices ?? []).filter((idx) => {
+          if (idx < Math.max(0, cursorTokenIndex - 3)) return false;
+          const lineIdx = getLineIndexForToken(prepared.lines, idx);
+          return lineIdx <= currentLineIndex + 2;
+        });
+
+        if (filtered.length > 0) {
+          setSpokenTokenIndices((prev) => {
+            const next = new Set(prev);
+            for (const idx of filtered) next.add(idx);
+            return next;
+          });
         }
-        return next;
-      });
-    }
-    spokenMatchCursorRef.current = Math.max(
-      spokenMatchCursorRef.current,
-      filteredMatches.length > 0
-        ? filteredMatches[filteredMatches.length - 1] + 1
-        : nextTokenIndex,
-    );
+        spokenMatchCursorRef.current = Math.max(
+          spokenMatchCursorRef.current,
+          filtered.length > 0
+            ? filtered[filtered.length - 1] + 1
+            : regionEnd,
+        );
+      } catch {
+        // aborted or network error -- ignore
+      }
+    })();
+
+    return () => controller.abort();
   }, [
     alignmentFrozen,
     cursorTokenIndex,
@@ -600,7 +689,7 @@ export function TeleprompterApp() {
     mode,
     prepared.lines,
     prepared.tokens,
-    rollingWindow,
+    shortTranscript,
     status,
   ]);
 
@@ -611,16 +700,17 @@ export function TeleprompterApp() {
     }
 
     const timer = window.setInterval(() => {
-      if (updates.length === 0) {
+      if (activityUpdates.length === 0) {
         setIsRealtimeStalled(false);
         return;
       }
-      const lastUpdateAt = updates[updates.length - 1]?.createdAt ?? 0;
-      setIsRealtimeStalled(Date.now() - lastUpdateAt > 2_000);
+      const lastUpdateAt =
+        activityUpdates[activityUpdates.length - 1]?.createdAt ?? 0;
+      setIsRealtimeStalled(Date.now() - lastUpdateAt > 4_000);
     }, 500);
 
     return () => window.clearInterval(timer);
-  }, [mode, status, updates]);
+  }, [activityUpdates, mode, status]);
 
   useEffect(() => {
     if (isFrozen) {
@@ -628,43 +718,6 @@ export function TeleprompterApp() {
       frozenAtTimestampRef.current = Date.now();
     }
   }, [isFrozen, cursorTokenIndex]);
-
-  useEffect(() => {
-    if (!isFrozen || mode !== "readback" || status !== "connected") {
-      return;
-    }
-    if (prepared.tokens.length === 0) {
-      return;
-    }
-
-    const postFreezeText = updates
-      .filter((u) => u.createdAt >= frozenAtTimestampRef.current)
-      .map((u) => u.text.trim())
-      .filter(Boolean)
-      .join(" ");
-
-    if (!postFreezeText.trim()) {
-      return;
-    }
-
-    const probeResult = advanceCursorFromTranscript({
-      currentTokenIndex: frozenAtTokenIndexRef.current,
-      transcriptWindow: postFreezeText,
-      scriptTokens: prepared.tokens,
-      maxAdvancePerTick: 24,
-      maxLookahead: 64,
-    });
-
-    if (probeResult > frozenAtTokenIndexRef.current + 1) {
-      setIsFrozen(false);
-      setIsSemanticallyPaused(false);
-      setCursorTokenIndex((previous) => Math.max(previous, probeResult));
-      spokenMatchCursorRef.current = Math.max(
-        spokenMatchCursorRef.current,
-        probeResult,
-      );
-    }
-  }, [isFrozen, mode, prepared.tokens, status, updates]);
 
   useEffect(() => {
     if (mode !== "readback") {
@@ -1016,7 +1069,7 @@ export function TeleprompterApp() {
               </button>
             </header>
 
-            <section className="mx-auto mt-4 flex w-full max-w-7xl flex-1 flex-col gap-4 overflow-hidden">
+            <section className="mx-auto mt-6 flex w-full max-w-7xl flex-1 flex-col gap-4 overflow-hidden">
               {error ? (
                 <div className="rounded-xl border border-rose-800/60 bg-rose-950/40 px-4 py-2 text-sm text-rose-200">
                   {error}
@@ -1029,6 +1082,7 @@ export function TeleprompterApp() {
                 currentTokenIndex={Math.floor(smoothedTokenIndex)}
                 spokenTokenIndices={spokenTokenIndices}
                 frozen={alignmentFrozen || playbackFrozen}
+                frozenReason={freezeReason}
                 mediaStream={mediaStream}
                 maxVisibleRows={DEFAULT_MAX_LINES}
                 textSize={settings.textSize}
@@ -1038,13 +1092,11 @@ export function TeleprompterApp() {
 
               <SurfacePanel className="p-4">
                 <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-400">
-                  Rolling transcript (last ~10s)
-                  {isBrowserSpeechSupported
-                    ? " · hybrid browser + realtime"
-                    : " · realtime only"}
+                  Rolling transcript
+                  {" · last sentence"}
                 </h2>
                 <p className="min-h-16 text-sm leading-6 text-zinc-300">
-                  {rollingWindow || latestTranscript || "Listening..."}
+                  {shortTranscript || latestTranscript || "Listening..."}
                 </p>
               </SurfacePanel>
             </section>

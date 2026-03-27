@@ -200,13 +200,44 @@ function extractTranscriptText(event: RealtimeEventEnvelope): string {
   return "";
 }
 
+const HALLUCINATION_ENDINGS = [
+  "thank you.",
+  "thanks.",
+  "thanks for watching.",
+  "bye.",
+  "goodbye.",
+  "thank you so much.",
+  "thank you for listening.",
+  "please subscribe.",
+  "like and subscribe.",
+];
+
+export function stripTrailingHallucinations(text: string): string {
+  let result = text.trim();
+  if (!result) return result;
+
+  const lower = result.toLowerCase();
+  for (const phrase of HALLUCINATION_ENDINGS) {
+    if (lower === phrase) return result;
+    if (lower.endsWith(phrase)) {
+      const stripped = result
+        .slice(0, result.length - phrase.length)
+        .replace(/[\s.]+$/, "")
+        .trim();
+      if (stripped.length >= 2) return stripped;
+      return result;
+    }
+  }
+  return result;
+}
+
 export function eventToTranscriptUpdate(
   event: RealtimeEventEnvelope,
 ): TranscriptUpdate | null {
   if (!isTranscriptEvent(event)) return null;
 
-  const text = extractTranscriptText(event);
-  if (!text) return null;
+  const rawText = extractTranscriptText(event);
+  if (!rawText) return null;
 
   const now = Date.now();
   const kind: "partial" | "final" =
@@ -215,6 +246,9 @@ export function eventToTranscriptUpdate(
     event.type.endsWith(".final")
       ? "final"
       : "partial";
+
+  const text = kind === "final" ? stripTrailingHallucinations(rawText) : rawText;
+  if (!text.trim()) return null;
 
   return { id: `${kind}-${now}`, text, kind, createdAt: now };
 }
@@ -259,8 +293,7 @@ export function isRealtimeAlignmentTextDoneEvent(
 ): event is RealtimeResponseTextDoneEvent {
   return (
     event.type === "response.output_text.done" ||
-    event.type === "response.text.done" ||
-    event.type === "response.done"
+    event.type === "response.text.done"
   );
 }
 
@@ -360,4 +393,20 @@ export function collectRollingWindow(
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+const SENTENCE_BOUNDARY = /[.!?]+\s+/;
+const MAX_SENTENCE_WORDS = 20;
+
+export function extractLastSentence(windowText: string): string {
+  const trimmed = windowText.trim();
+  if (!trimmed) return "";
+
+  const sentences = trimmed.split(SENTENCE_BOUNDARY).filter(Boolean);
+  const last = (sentences[sentences.length - 1] ?? "").trim();
+  if (!last) return "";
+
+  const words = last.split(/\s+/);
+  if (words.length <= MAX_SENTENCE_WORDS) return last;
+  return words.slice(-MAX_SENTENCE_WORDS).join(" ");
 }
